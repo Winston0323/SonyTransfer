@@ -1,0 +1,385 @@
+import 'package:flutter/material.dart';
+
+import '../models/camera_item.dart';
+import '../models/timeline.dart';
+import '../services/transfer_service.dart';
+
+/// Shots grouped by capture day, newest first, with tap-to-select tiles.
+class TimelineView extends StatelessWidget {
+  const TimelineView({
+    super.key,
+    required this.sections,
+    required this.selected,
+    required this.outcomes,
+    required this.onToggle,
+    required this.onToggleDay,
+    this.loadingMore = false,
+  });
+
+  final List<TimelineSection> sections;
+  final Set<String> selected;
+  final Map<String, TransferOutcome> outcomes;
+
+  /// Older shots are still on their way, so the end of the list is not the end
+  /// of the card.
+  final bool loadingMore;
+  final ValueChanged<CameraItem> onToggle;
+  final ValueChanged<TimelineSection> onToggleDay;
+
+  @override
+  Widget build(BuildContext context) {
+    return CustomScrollView(
+      slivers: [
+        for (final section in sections) ...[
+          SliverToBoxAdapter(
+            child: _DayHeader(
+              section: section,
+              selected: selected,
+              onToggleDay: onToggleDay,
+            ),
+          ),
+          SliverPadding(
+            padding: const EdgeInsets.symmetric(horizontal: 8),
+            sliver: SliverGrid.builder(
+              gridDelegate:
+                  const SliverGridDelegateWithFixedCrossAxisCount(
+                crossAxisCount: 3,
+                mainAxisSpacing: 4,
+                crossAxisSpacing: 4,
+              ),
+              itemCount: section.items.length,
+              itemBuilder: (context, index) {
+                final item = section.items[index];
+                return _ShotTile(
+                  item: item,
+                  selected: selected.contains(item.id),
+                  outcome: outcomes[item.id],
+                  onToggle: () => onToggle(item),
+                );
+              },
+            ),
+          ),
+        ],
+        SliverToBoxAdapter(
+          child: loadingMore
+              ? const _LoadingOlder()
+              : const SizedBox(height: 12),
+        ),
+      ],
+    );
+  }
+}
+
+class _LoadingOlder extends StatelessWidget {
+  const _LoadingOlder();
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 20),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          const SizedBox(
+            width: 14,
+            height: 14,
+            child: CircularProgressIndicator(strokeWidth: 2),
+          ),
+          const SizedBox(width: 10),
+          Text(
+            'Loading older shots',
+            style: theme.textTheme.bodySmall?.copyWith(color: theme.hintColor),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _DayHeader extends StatelessWidget {
+  const _DayHeader({
+    required this.section,
+    required this.selected,
+    required this.onToggleDay,
+  });
+
+  final TimelineSection section;
+  final Set<String> selected;
+  final ValueChanged<TimelineSection> onToggleDay;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final transferable =
+        section.items.where((i) => !i.isRawOnly).map((i) => i.id).toSet();
+    final allChosen =
+        transferable.isNotEmpty && selected.containsAll(transferable);
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 16, 8, 8),
+      child: Row(
+        children: [
+          Expanded(
+            child: Text(
+              timelineDayLabel(section.day),
+              style: theme.textTheme.titleSmall,
+            ),
+          ),
+          Text(
+            '${section.items.length}',
+            style: theme.textTheme.bodySmall?.copyWith(color: theme.hintColor),
+          ),
+          if (transferable.isNotEmpty)
+            TextButton(
+              onPressed: () => onToggleDay(section),
+              child: Text(allChosen ? 'None' : 'All'),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+class _ShotTile extends StatelessWidget {
+  const _ShotTile({
+    required this.item,
+    required this.selected,
+    required this.outcome,
+    required this.onToggle,
+  });
+
+  final CameraItem item;
+  final bool selected;
+  final TransferOutcome? outcome;
+  final VoidCallback onToggle;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final url = item.thumbnail?.url;
+
+    return GestureDetector(
+      onTap: () => _showPreview(context),
+      // Long-press picks shots without aiming for the corner box, the way a
+      // gallery app does.
+      onLongPress: item.isRawOnly ? null : onToggle,
+      child: Stack(
+        fit: StackFit.expand,
+        children: [
+          ColoredBox(
+            color: theme.colorScheme.surfaceContainerHighest,
+            child: url == null
+                ? const Icon(Icons.broken_image_outlined)
+                : Image.network(
+                    url,
+                    fit: BoxFit.cover,
+                    gaplessPlayback: true,
+                    errorBuilder: (_, _, _) =>
+                        const Icon(Icons.broken_image_outlined),
+                    loadingBuilder: (context, child, chunk) => chunk == null
+                        ? child
+                        : const Center(
+                            child: SizedBox(
+                              width: 18,
+                              height: 18,
+                              child:
+                                  CircularProgressIndicator(strokeWidth: 2),
+                            ),
+                          ),
+                  ),
+          ),
+          if (item.isRawOnly)
+            Container(
+              color: Colors.black54,
+              alignment: Alignment.center,
+              child: Text(
+                'RAW',
+                style: theme.textTheme.labelSmall
+                    ?.copyWith(color: Colors.white70),
+              ),
+            ),
+          if (selected)
+            Container(
+              decoration: BoxDecoration(
+                border: Border.all(color: theme.colorScheme.primary, width: 3),
+                color: theme.colorScheme.primary.withValues(alpha: 0.25),
+              ),
+            ),
+          if (!item.isRawOnly)
+            Positioned(
+              top: 0,
+              right: 0,
+              child: _SelectBox(selected: selected, onTap: onToggle),
+            ),
+          if (outcome != null)
+            Positioned(
+              bottom: 4,
+              right: 4,
+              child: _OutcomeDot(outcome: outcome!),
+            ),
+        ],
+      ),
+    );
+  }
+
+  void _showPreview(BuildContext context) {
+    if (item.preview == null) return;
+
+    showDialog<void>(
+      context: context,
+      builder: (context) => _PreviewDialog(
+        item: item,
+        selected: selected,
+        onToggle: item.isRawOnly ? null : onToggle,
+      ),
+    );
+  }
+}
+
+/// The tap target that picks a shot, kept distinct from the tile so tapping the
+/// picture itself can open the preview.
+class _SelectBox extends StatelessWidget {
+  const _SelectBox({required this.selected, required this.onTap});
+
+  final bool selected;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+
+    return GestureDetector(
+      onTap: onTap,
+      // Transparent rather than null, so the padding around the icon still takes
+      // the tap instead of letting it fall through to the preview.
+      behavior: HitTestBehavior.opaque,
+      child: Padding(
+        padding: const EdgeInsets.all(6),
+        child: DecoratedBox(
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            color: selected ? Colors.white : Colors.black38,
+          ),
+          child: Icon(
+            selected ? Icons.check_circle : Icons.circle_outlined,
+            size: 24,
+            color: selected ? theme.colorScheme.primary : Colors.white,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Full-size preview, with the same select action so a shot can be picked after
+/// a proper look at it.
+class _PreviewDialog extends StatefulWidget {
+  const _PreviewDialog({
+    required this.item,
+    required this.selected,
+    required this.onToggle,
+  });
+
+  final CameraItem item;
+  final bool selected;
+
+  /// Null for raw shots, which cannot be transferred.
+  final VoidCallback? onToggle;
+
+  @override
+  State<_PreviewDialog> createState() => _PreviewDialogState();
+}
+
+class _PreviewDialogState extends State<_PreviewDialog> {
+  late bool _selected = widget.selected;
+
+  void _toggle() {
+    widget.onToggle!();
+    setState(() => _selected = !_selected);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final item = widget.item;
+
+    return Dialog(
+      insetPadding: const EdgeInsets.all(12),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Flexible(
+            child: InteractiveViewer(
+              child: Image.network(
+                item.preview!.url,
+                fit: BoxFit.contain,
+                errorBuilder: (_, _, _) => const Padding(
+                  padding: EdgeInsets.all(48),
+                  child: Icon(Icons.broken_image_outlined, size: 48),
+                ),
+                loadingBuilder: (context, child, chunk) => chunk == null
+                    ? child
+                    : const Padding(
+                        padding: EdgeInsets.all(48),
+                        child: CircularProgressIndicator(),
+                      ),
+              ),
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 12, 8, 8),
+            child: Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    item.isRawOnly
+                        ? '${item.fileName} · raw, preview only'
+                        : item.fileName,
+                    style: theme.textTheme.bodySmall,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+                if (widget.onToggle != null)
+                  TextButton.icon(
+                    onPressed: _toggle,
+                    icon: Icon(
+                      _selected ? Icons.check_circle : Icons.circle_outlined,
+                    ),
+                    label: Text(_selected ? 'Selected' : 'Select'),
+                  ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _OutcomeDot extends StatelessWidget {
+  const _OutcomeDot({required this.outcome});
+
+  final TransferOutcome outcome;
+
+  @override
+  Widget build(BuildContext context) {
+    final (IconData icon, Color color) = switch (outcome) {
+      TransferOutcome.saved => (Icons.check_circle, Colors.green),
+      TransferOutcome.skippedExisting => (Icons.done_all, Colors.white70),
+      TransferOutcome.skippedRaw => (Icons.remove_circle_outline, Colors.white38),
+      TransferOutcome.failed => (
+          Icons.error,
+          Theme.of(context).colorScheme.error
+        ),
+    };
+
+    return DecoratedBox(
+      decoration: const BoxDecoration(
+        color: Colors.black54,
+        shape: BoxShape.circle,
+      ),
+      child: Icon(icon, size: 18, color: color),
+    );
+  }
+}
