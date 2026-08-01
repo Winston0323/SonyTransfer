@@ -55,6 +55,31 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _scanning = false;
   String? _rememberedSsid;
 
+  /// Whether a sighting of the remembered camera network should join
+  /// automatically rather than waiting for a tap on Connect.
+  bool _autoConnect = true;
+
+  /// The SSID auto-connect last tried, so a failed attempt (e.g. a stale
+  /// password) does not retry every scan while the network stays in range.
+  /// Cleared once that network drops out of range, so the next sighting —
+  /// after a password fix, or just the camera being turned back on — tries
+  /// again.
+  String? _autoConnectedSsid;
+
+  /// Rescans periodically while idle, which is what makes "auto-connect"
+  /// mean turning the camera on rather than having to reopen the app.
+  Timer? _autoScanTimer;
+
+  /// Polls whether the camera's Wi-Fi is still associated while connected, so
+  /// switching the camera off sends the app back to the setup screen instead
+  /// of sitting on a now-stale shot list.
+  Timer? _connectionWatchdog;
+  int _wifiMissCount = 0;
+
+  /// Bumped by [_reset] so a transfer loop or connect attempt already in
+  /// flight can tell it has been superseded and should stop touching state.
+  int _sessionId = 0;
+
   List<CameraItem> _items = const [];
   List<TimelineSection> _sections = const [];
   final Set<String> _selected = {};
@@ -85,6 +110,46 @@ class _HomeScreenState extends State<HomeScreen> {
     super.initState();
     _restoreCredentials();
     _loadDestinationFolder();
+    _autoScanTimer = Timer.periodic(const Duration(seconds: 10), (_) {
+      if (_stage == _Stage.idle && !_scanning) _scanNetworks();
+    });
+    _connectionWatchdog = Timer.periodic(
+      const Duration(seconds: 5),
+      (_) => _checkCameraStillReachable(),
+    );
+  }
+
+  /// Detects the camera switching its Wi-Fi off (or the phone drifting onto
+  /// another network) and, once confirmed, sends the app back to the setup
+  /// screen instead of leaving a now-unreachable session on screen.
+  Future<void> _checkCameraStillReachable() async {
+    if (_stage == _Stage.idle || _stage == _Stage.connecting) return;
+
+    final ssid = await NetworkBinding.currentWifiSsid();
+    if (!mounted || _stage == _Stage.idle || _stage == _Stage.connecting) {
+      return;
+    }
+
+    if (ssid != null && _looksLikeCameraSsid(ssid)) {
+      _wifiMissCount = 0;
+      return;
+    }
+
+    // A single missed read can just be a flaky SSID lookup; two in a row,
+    // five seconds apart, is the camera actually gone.
+    _wifiMissCount++;
+    if (_wifiMissCount < 2) return;
+    _wifiMissCount = 0;
+    await _handleCameraLost();
+  }
+
+  Future<void> _handleCameraLost() async {
+    if (_stage == _Stage.idle) return;
+    if (_stage == _Stage.transferring) _transfer.cancel();
+    await _reset(
+      statusOverride: "Camera Wi-Fi lost — it may have turned off. "
+          'Reconnect once it is back on.',
+    );
   }
 
   Future<void> _loadDestinationFolder() async {
@@ -111,6 +176,7 @@ class _HomeScreenState extends State<HomeScreen> {
     setState(() {
       _rememberedSsid = saved.ssid;
       _selectedSsid = saved.ssid;
+      _autoConnect = saved.autoConnect;
       if (saved.ssid != null && saved.ssid!.isNotEmpty) {
         _ssidController.text = saved.ssid!;
       }
@@ -119,6 +185,19 @@ class _HomeScreenState extends State<HomeScreen> {
       }
     });
     await _scanNetworks();
+  }
+
+  Future<void> _setAutoConnect(bool value) async {
+    setState(() => _autoConnect = value);
+    await SavedWifiCredentials.saveAutoConnect(value);
+  }
+
+  /// The remembered network if this scan sees it, or the sole camera network
+  /// in range when there is no remembered one to prefer.
+  String? _matchedCameraSsid(List<String> cameras) {
+    if (cameras.contains(_rememberedSsid)) return _rememberedSsid;
+    if (cameras.length == 1) return cameras.single;
+    return null;
   }
 
   Future<void> _scanNetworks() async {
@@ -131,6 +210,8 @@ class _HomeScreenState extends State<HomeScreen> {
     try {
       final scan = await NetworkBinding.scanCameraWifi();
       if (!mounted) return;
+
+      final matched = _matchedCameraSsid(scan.cameras);
       setState(() {
         _cameraNetworks = scan.cameras;
         _allNetworks = scan.all;
@@ -140,19 +221,33 @@ class _HomeScreenState extends State<HomeScreen> {
         // Prefer an in-range remembered network, then a sole match. A remembered
         // name that this scan missed is kept: the camera may still be waking, and
         // the join can proceed without a fresh sighting.
-        if (!scan.cameras.contains(_selectedSsid)) {
-          if (scan.cameras.contains(_rememberedSsid)) {
-            _selectedSsid = _rememberedSsid;
-          } else if (scan.cameras.length == 1) {
-            _selectedSsid = scan.cameras.single;
-          }
+        if (!scan.cameras.contains(_selectedSsid) && matched != null) {
+          _selectedSsid = matched;
         }
         if (_selectedSsid != null &&
             _selectedSsid!.isNotEmpty &&
             _ssidController.text.trim().isEmpty) {
           _ssidController.text = _selectedSsid!;
         }
+
+        // Forget a stale auto-connect attempt once its network drops out of
+        // range, so the same camera can be auto-joined again next time it
+        // shows up — after a password fix, or just being turned back on.
+        if (_autoConnectedSsid != null &&
+            !scan.cameras.contains(_autoConnectedSsid)) {
+          _autoConnectedSsid = null;
+        }
       });
+
+      final shouldAutoConnect = _autoConnect &&
+          _stage == _Stage.idle &&
+          matched != null &&
+          matched != _autoConnectedSsid &&
+          _passwordController.text.isNotEmpty;
+      if (shouldAutoConnect) {
+        _autoConnectedSsid = matched;
+        unawaited(_connect());
+      }
     } on PlatformException catch (e) {
       if (!mounted) return;
       setState(() {
@@ -170,6 +265,8 @@ class _HomeScreenState extends State<HomeScreen> {
 
   @override
   void dispose() {
+    _autoScanTimer?.cancel();
+    _connectionWatchdog?.cancel();
     _listing?.cancel();
     _hostController.dispose();
     _ssidController.dispose();
@@ -412,6 +509,11 @@ class _HomeScreenState extends State<HomeScreen> {
         _transferableItems.where((i) => _selected.contains(i.id)).toList();
     if (queue.isEmpty) return;
 
+    // If the camera drops off mid-transfer, the connection watchdog resets
+    // straight to the setup screen; this lets the loop below notice and stop
+    // instead of overwriting that with its own "finished" summary.
+    final session = _sessionId;
+
     _transfer.resetCancel();
     setState(() {
       _stage = _Stage.transferring;
@@ -431,7 +533,7 @@ class _HomeScreenState extends State<HomeScreen> {
     );
 
     await for (final result in stream) {
-      if (!mounted) return;
+      if (!mounted || _sessionId != session) return;
 
       // A skipped shot downloads nothing, so no progress arrives for it and the
       // bar would otherwise sit at the previous shot's 100%.
@@ -448,7 +550,7 @@ class _HomeScreenState extends State<HomeScreen> {
         }
       });
     }
-    if (!mounted) return;
+    if (!mounted || _sessionId != session) return;
 
     final cancelled = _transfer.isCancelled;
     final saved =
@@ -469,7 +571,14 @@ class _HomeScreenState extends State<HomeScreen> {
     if (!cancelled) await _client?.transferEnd();
   }
 
-  Future<void> _reset() async {
+  /// Returns to the setup screen. [statusOverride] replaces the usual
+  /// "Left the camera Wi-Fi" message — used when this was not a manual
+  /// Disconnect tap but the camera dropping off on its own.
+  Future<void> _reset({String? statusOverride}) async {
+    // Lets a transfer loop or connect attempt still in flight recognise it
+    // has been superseded and stop applying its own state on top of this.
+    _sessionId++;
+
     _listing?.cancel();
     _listing = null;
 
@@ -493,15 +602,16 @@ class _HomeScreenState extends State<HomeScreen> {
       _outcomes.clear();
       _cameraName = null;
       _error = null;
-      _status = switch (left) {
-        WifiDisconnectResult.released => 'Left the camera Wi-Fi.',
-        WifiDisconnectResult.openedSettings =>
-          'Open the Wi-Fi panel and leave the DIRECT- network — Android will not '
-              'let the app drop a network you joined in Settings.',
-        WifiDisconnectResult.failed =>
-          'Disconnected from the camera, but the phone may still be on its Wi-Fi. '
-              'Leave the DIRECT- network in Android Wi-Fi settings.',
-      };
+      _status = statusOverride ??
+          switch (left) {
+            WifiDisconnectResult.released => 'Left the camera Wi-Fi.',
+            WifiDisconnectResult.openedSettings =>
+              'Open the Wi-Fi panel and leave the DIRECT- network — Android will not '
+                  'let the app drop a network you joined in Settings.',
+            WifiDisconnectResult.failed =>
+              'Disconnected from the camera, but the phone may still be on its Wi-Fi. '
+                  'Leave the DIRECT- network in Android Wi-Fi settings.',
+          };
       _done = 0;
     });
     _progress.value = null;
@@ -538,61 +648,76 @@ class _HomeScreenState extends State<HomeScreen> {
       ),
       body: Column(
         children: [
-          _StatusPanel(
-            stage: _stage,
-            cameraName: _cameraName,
-            hostController: _hostController,
-            ssidController: _ssidController,
-            passwordController: _passwordController,
-            cameraNetworks: _cameraNetworks,
-            allNetworks: _allNetworks,
-            scanProblem: _scanProblem,
-            showAllNetworks: _showAllNetworks,
-            onShowAllNetworks: () =>
-                setState(() => _showAllNetworks = !_showAllNetworks),
-            selectedSsid: _selectedSsid,
-            scanning: _scanning,
-            onSelectSsid: (ssid) => setState(() {
-              _selectedSsid = ssid;
-              if (_ssidController.text != ssid) {
-                _ssidController.value = TextEditingValue(
-                  text: ssid,
-                  selection: TextSelection.collapsed(offset: ssid.length),
-                );
-              }
-            }),
-            onSsidEdited: (ssid) => setState(() => _selectedSsid = ssid),
-            onScan: _scanNetworks,
-            onOpenWifiSettings: NetworkBinding.openWifiSettings,
-            onOpenLocationSettings: NetworkBinding.openLocationSettings,
-            onOpenAppSettings: NetworkBinding.openAppSettings,
-            status: _status,
-            error: _error,
-            destinationFolderName: _destinationFolderName,
-            onPickDestinationFolder: _pickDestinationFolder,
-            onClearDestinationFolder: _clearDestinationFolder,
-            itemCount: _items.length,
-            transferable: _transferable,
-            selectedCount: _selected.length,
-            autoDetect: _autoDetect,
-            onAutoDetectChanged: (value) =>
-                setState(() => _autoDetect = value),
-            onConnect: () => _connect(),
-          ),
-          const Divider(height: 1),
           Expanded(
-            child: switch ((_sections.isEmpty, _loading)) {
-              (true, true) => const Center(child: CircularProgressIndicator()),
-              (true, false) => const _Instructions(),
-              _ => TimelineView(
-                  sections: _sections,
-                  selected: _selected,
-                  outcomes: _outcomes,
-                  loadingMore: _loading,
-                  onToggle: _toggle,
-                  onToggleDay: _toggleDay,
+            child: CustomScrollView(
+              slivers: [
+                SliverToBoxAdapter(
+                  child: _StatusPanel(
+                    stage: _stage,
+                    cameraName: _cameraName,
+                    hostController: _hostController,
+                    ssidController: _ssidController,
+                    passwordController: _passwordController,
+                    cameraNetworks: _cameraNetworks,
+                    allNetworks: _allNetworks,
+                    scanProblem: _scanProblem,
+                    showAllNetworks: _showAllNetworks,
+                    onShowAllNetworks: () =>
+                        setState(() => _showAllNetworks = !_showAllNetworks),
+                    selectedSsid: _selectedSsid,
+                    scanning: _scanning,
+                    onSelectSsid: (ssid) => setState(() {
+                      _selectedSsid = ssid;
+                      if (_ssidController.text != ssid) {
+                        _ssidController.value = TextEditingValue(
+                          text: ssid,
+                          selection:
+                              TextSelection.collapsed(offset: ssid.length),
+                        );
+                      }
+                    }),
+                    onSsidEdited: (ssid) =>
+                        setState(() => _selectedSsid = ssid),
+                    onScan: _scanNetworks,
+                    onOpenWifiSettings: NetworkBinding.openWifiSettings,
+                    onOpenLocationSettings:
+                        NetworkBinding.openLocationSettings,
+                    onOpenAppSettings: NetworkBinding.openAppSettings,
+                    status: _status,
+                    error: _error,
+                    destinationFolderName: _destinationFolderName,
+                    onPickDestinationFolder: _pickDestinationFolder,
+                    onClearDestinationFolder: _clearDestinationFolder,
+                    itemCount: _items.length,
+                    transferable: _transferable,
+                    selectedCount: _selected.length,
+                    autoDetect: _autoDetect,
+                    onAutoDetectChanged: (value) =>
+                        setState(() => _autoDetect = value),
+                    autoConnect: _autoConnect,
+                    onAutoConnectChanged: _setAutoConnect,
+                    onConnect: () => _connect(),
+                  ),
                 ),
-            },
+                const SliverToBoxAdapter(child: Divider(height: 1)),
+                if (_sections.isEmpty && _loading)
+                  const SliverFillRemaining(
+                    hasScrollBody: false,
+                    child: Center(child: CircularProgressIndicator()),
+                  )
+                else if (_sections.isEmpty)
+                  const SliverToBoxAdapter(child: _Instructions())
+                else
+                  ...TimelineView.slivers(
+                    sections: _sections,
+                    selected: _selected,
+                    outcomes: _outcomes,
+                    loadingMore: _loading,
+                    onToggle: _toggle,
+                    onToggleDay: _toggleDay,
+                  ),
+              ],
+            ),
           ),
           _BottomBar(
             stage: _stage,
@@ -639,6 +764,8 @@ class _StatusPanel extends StatelessWidget {
     required this.selectedCount,
     required this.autoDetect,
     required this.onAutoDetectChanged,
+    required this.autoConnect,
+    required this.onAutoConnectChanged,
     required this.onConnect,
   });
 
@@ -673,6 +800,10 @@ class _StatusPanel extends StatelessWidget {
   final int selectedCount;
   final bool autoDetect;
   final ValueChanged<bool> onAutoDetectChanged;
+
+  /// Whether a sighting of the remembered camera network joins automatically.
+  final bool autoConnect;
+  final ValueChanged<bool> onAutoConnectChanged;
   final VoidCallback onConnect;
 
   List<String> _chips() =>
@@ -829,6 +960,16 @@ class _StatusPanel extends StatelessWidget {
               controller: passwordController,
               enabled: !busy,
               onSubmitted: onConnect,
+            ),
+            SwitchListTile(
+              value: autoConnect,
+              onChanged: onAutoConnectChanged,
+              dense: true,
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Auto-connect'),
+              subtitle: const Text(
+                'Joins as soon as this Wi-Fi and its saved password are found',
+              ),
             ),
             SwitchListTile(
               value: autoDetect,
@@ -989,43 +1130,46 @@ class _Instructions extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    return ListView(
+    return Padding(
       padding: const EdgeInsets.all(20),
-      children: [
-        Text('Getting the camera ready', style: theme.textTheme.titleSmall),
-        const SizedBox(height: 16),
-        for (var i = 0; i < _steps.length; i++)
-          Padding(
-            padding: const EdgeInsets.only(bottom: 14),
-            child: Row(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                CircleAvatar(
-                  radius: 12,
-                  backgroundColor: theme.colorScheme.primaryContainer,
-                  child: Text(
-                    '${i + 1}',
-                    style: TextStyle(
-                      fontSize: 12,
-                      color: theme.colorScheme.onPrimaryContainer,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text('Getting the camera ready', style: theme.textTheme.titleSmall),
+          const SizedBox(height: 16),
+          for (var i = 0; i < _steps.length; i++)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 14),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  CircleAvatar(
+                    radius: 12,
+                    backgroundColor: theme.colorScheme.primaryContainer,
+                    child: Text(
+                      '${i + 1}',
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: theme.colorScheme.onPrimaryContainer,
+                      ),
                     ),
                   ),
-                ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: Text(_steps[i], style: theme.textTheme.bodyMedium),
-                ),
-              ],
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Text(_steps[i], style: theme.textTheme.bodyMedium),
+                  ),
+                ],
+              ),
             ),
+          const SizedBox(height: 8),
+          Text(
+            'Raw files are listed but cannot be transferred: over this '
+            'protocol the camera only serves embedded preview JPEGs for '
+            'ARW, never the raw data. Use the SD card for those.',
+            style: theme.textTheme.bodySmall?.copyWith(color: theme.hintColor),
           ),
-        const SizedBox(height: 8),
-        Text(
-          'Raw files are listed but cannot be transferred: over this protocol '
-          'the camera only serves embedded preview JPEGs for ARW, never the raw '
-          'data. Use the SD card for those.',
-          style: theme.textTheme.bodySmall?.copyWith(color: theme.hintColor),
-        ),
-      ],
+        ],
+      ),
     );
   }
 }

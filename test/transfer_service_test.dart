@@ -193,6 +193,43 @@ void main() {
     expect(stopwatch.elapsed, lessThan(step * 5));
   });
 
+  test(
+    'reports a shot as done once its gallery copy finishes, not once the '
+    'next shot finishes downloading',
+    () async {
+      const chunks = 4;
+      const size = chunks * _chunkSize;
+      // The next download takes far longer than the gallery copy — the
+      // realistic case, since filing a shot into the gallery is a local
+      // disk copy while the download crosses a slow camera Wi-Fi link.
+      const downloadDelay = Duration(milliseconds: 200);
+      final galleryFinishedAt = <String, int>{};
+      final resultReceivedAt = <String, int>{};
+      final stopwatch = Stopwatch()..start();
+
+      final service = TransferService(
+        client: _streamingClient(chunks, delay: downloadDelay),
+        destination: temp,
+        saveToGallery: (file) async {
+          galleryFinishedAt[p.basename(file.path)] = stopwatch.elapsedMilliseconds;
+        },
+      );
+
+      await for (final result in service.transferAll([
+        _jpeg(byteSize: size, title: 'A.JPG'),
+        _jpeg(byteSize: size, title: 'B.JPG'),
+      ])) {
+        resultReceivedAt[result.item.title] = stopwatch.elapsedMilliseconds;
+      }
+
+      // A's gallery copy is essentially instantaneous, so its result should
+      // reach the caller shortly after — not get held back until B's
+      // download (a further 200ms away) also finishes.
+      final lag = resultReceivedAt['A.JPG']! - galleryFinishedAt['A.JPG']!;
+      expect(lag, lessThan(downloadDelay.inMilliseconds ~/ 2));
+    },
+  );
+
   test('skips a file already on disk at the advertised size', () async {
     const chunks = 4;
     const size = chunks * _chunkSize;

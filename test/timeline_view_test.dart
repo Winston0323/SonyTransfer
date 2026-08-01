@@ -21,6 +21,15 @@ CameraItem _shot(String name, {DateTime? at, bool raw = false}) => CameraItem(
       ],
     );
 
+/// Advances past route-transition and other short-lived animations without
+/// [WidgetTester.pumpAndSettle]'s "nothing may still be pending" requirement
+/// - the grid's thumbnails fetch for real (and never resolve against these
+/// fake `http://camera/...` URLs), so nothing here ever fully settles.
+Future<void> _settle(WidgetTester tester) async {
+  await tester.pump();
+  await tester.pump(const Duration(milliseconds: 400));
+}
+
 Future<void> _pump(
   WidgetTester tester, {
   required List<CameraItem> items,
@@ -77,7 +86,7 @@ void main() {
 
     expect(tapped, ['a.JPG']);
     // Selecting must not also open the preview.
-    await tester.pumpAndSettle();
+    await _settle(tester);
     expect(find.byType(PreviewPage), findsNothing);
   });
 
@@ -91,7 +100,7 @@ void main() {
       onToggle: (i) => tapped.add(i.id),
     );
 
-    await tester.longPress(find.byType(Image));
+    await tester.longPress(find.byKey(const ValueKey('a.JPG')));
 
     expect(tapped, ['a.JPG']);
   });
@@ -153,8 +162,8 @@ void main() {
       onToggle: (_) {},
     );
 
-    await tester.tap(find.byType(Image));
-    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const ValueKey('a.JPG')));
+    await _settle(tester);
 
     expect(find.byType(PreviewPage), findsOneWidget);
     expect(find.text('a.JPG'), findsOneWidget);
@@ -173,12 +182,12 @@ void main() {
       onToggle: (_) {},
     );
 
-    await tester.tap(find.byType(Image).first);
-    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const ValueKey('a.JPG')));
+    await _settle(tester);
     expect(find.text('a.JPG'), findsOneWidget);
 
     await tester.drag(find.byType(PageView), const Offset(-600, 0));
-    await tester.pumpAndSettle();
+    await _settle(tester);
 
     expect(find.text('b.JPG'), findsOneWidget);
     expect(find.text('2 / 2'), findsOneWidget);
@@ -194,10 +203,10 @@ void main() {
       onToggle: (i) => tapped.add(i.id),
     );
 
-    await tester.tap(find.byType(Image));
-    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const ValueKey('a.JPG')));
+    await _settle(tester);
     await tester.tap(find.text('Select'));
-    await tester.pumpAndSettle();
+    await _settle(tester);
 
     expect(tapped, ['a.JPG']);
     expect(find.text('Selected'), findsOneWidget);
@@ -213,7 +222,7 @@ void main() {
     );
 
     await tester.tap(find.text('RAW'));
-    await tester.pumpAndSettle();
+    await _settle(tester);
 
     expect(find.textContaining('raw, preview only'), findsOneWidget);
     expect(find.text('Select'), findsNothing);

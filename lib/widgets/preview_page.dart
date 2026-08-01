@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../models/camera_item.dart';
+import 'cached_camera_image.dart';
 
 /// Full-screen photo viewer. Swiping moves through every shot in the
 /// timeline, in the same order the grid shows them, so swipe direction always
@@ -100,19 +101,17 @@ class _PreviewPageState extends State<PreviewPage> {
                       color: Colors.white54,
                       size: 48,
                     )
-                  : Image.network(
-                      url,
+                  : CachedCameraImage(
+                      url: url,
                       fit: BoxFit.contain,
-                      errorBuilder: (_, _, _) => const Icon(
+                      errorBuilder: (_) => const Icon(
                         Icons.broken_image_outlined,
                         color: Colors.white54,
                         size: 48,
                       ),
-                      loadingBuilder: (context, child, chunk) => chunk == null
-                          ? child
-                          : const CircularProgressIndicator(
-                              color: Colors.white54,
-                            ),
+                      loadingBuilder: (_) => const CircularProgressIndicator(
+                        color: Colors.white54,
+                      ),
                     ),
             ),
           );

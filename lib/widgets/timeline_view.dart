@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../models/camera_item.dart';
 import '../models/timeline.dart';
 import '../services/transfer_service.dart';
+import 'cached_camera_image.dart';
 import 'preview_page.dart';
 
 /// Shots grouped by capture day, newest first, with tap-to-select tiles.
@@ -29,6 +30,29 @@ class TimelineView extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    return CustomScrollView(
+      slivers: slivers(
+        sections: sections,
+        selected: selected,
+        outcomes: outcomes,
+        onToggle: onToggle,
+        onToggleDay: onToggleDay,
+        loadingMore: loadingMore,
+      ),
+    );
+  }
+
+  /// The day headers, grids, and trailing footer as bare slivers, so a parent
+  /// screen can drop them straight into its own [CustomScrollView] instead of
+  /// nesting a second, independently-scrolling one below the setup panel.
+  static List<Widget> slivers({
+    required List<TimelineSection> sections,
+    required Set<String> selected,
+    required Map<String, TransferOutcome> outcomes,
+    required ValueChanged<CameraItem> onToggle,
+    required ValueChanged<TimelineSection> onToggleDay,
+    bool loadingMore = false,
+  }) {
     // Flattened in display order, so swiping through the full-screen preview
     // steps through shots in exactly the order the grid shows them — day
     // sections in sequence, each section's own order within it.
@@ -37,55 +61,52 @@ class TimelineView extends StatelessWidget {
       for (var i = 0; i < flatItems.length; i++) flatItems[i].id: i,
     };
 
-    return CustomScrollView(
-      slivers: [
-        for (final section in sections) ...[
-          SliverToBoxAdapter(
-            child: _DayHeader(
-              section: section,
-              selected: selected,
-              onToggleDay: onToggleDay,
-            ),
+    return [
+      for (final section in sections) ...[
+        SliverToBoxAdapter(
+          child: _DayHeader(
+            section: section,
+            selected: selected,
+            onToggleDay: onToggleDay,
           ),
-          SliverPadding(
-            padding: const EdgeInsets.symmetric(horizontal: 8),
-            sliver: SliverGrid.builder(
-              gridDelegate:
-                  const SliverGridDelegateWithFixedCrossAxisCount(
-                crossAxisCount: 3,
-                mainAxisSpacing: 4,
-                crossAxisSpacing: 4,
-              ),
-              itemCount: section.items.length,
-              itemBuilder: (context, index) {
-                final item = section.items[index];
-                return _ShotTile(
-                  item: item,
-                  selected: selected.contains(item.id),
-                  outcome: outcomes[item.id],
-                  onToggle: () => onToggle(item),
-                  onOpenPreview: () => Navigator.of(context).push(
-                    MaterialPageRoute<void>(
-                      builder: (context) => PreviewPage(
-                        items: flatItems,
-                        initialIndex: indexById[item.id]!,
-                        selected: selected,
-                        onToggle: onToggle,
-                      ),
+        ),
+        SliverPadding(
+          padding: const EdgeInsets.symmetric(horizontal: 8),
+          sliver: SliverGrid.builder(
+            gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+              crossAxisCount: 3,
+              mainAxisSpacing: 4,
+              crossAxisSpacing: 4,
+            ),
+            itemCount: section.items.length,
+            itemBuilder: (context, index) {
+              final item = section.items[index];
+              return _ShotTile(
+                key: ValueKey(item.id),
+                item: item,
+                selected: selected.contains(item.id),
+                outcome: outcomes[item.id],
+                onToggle: () => onToggle(item),
+                onOpenPreview: () => Navigator.of(context).push(
+                  MaterialPageRoute<void>(
+                    builder: (context) => PreviewPage(
+                      items: flatItems,
+                      initialIndex: indexById[item.id]!,
+                      selected: selected,
+                      onToggle: onToggle,
                     ),
                   ),
-                );
-              },
-            ),
+                ),
+              );
+            },
           ),
-        ],
-        SliverToBoxAdapter(
-          child: loadingMore
-              ? const _LoadingOlder()
-              : const SizedBox(height: 12),
         ),
       ],
-    );
+      SliverToBoxAdapter(
+        child:
+            loadingMore ? const _LoadingOlder() : const SizedBox(height: 12),
+      ),
+    ];
   }
 }
 
@@ -162,6 +183,7 @@ class _DayHeader extends StatelessWidget {
 
 class _ShotTile extends StatelessWidget {
   const _ShotTile({
+    super.key,
     required this.item,
     required this.selected,
     required this.outcome,
@@ -192,22 +214,18 @@ class _ShotTile extends StatelessWidget {
             color: theme.colorScheme.surfaceContainerHighest,
             child: url == null
                 ? const Icon(Icons.broken_image_outlined)
-                : Image.network(
-                    url,
+                : CachedCameraImage(
+                    url: url,
                     fit: BoxFit.cover,
-                    gaplessPlayback: true,
-                    errorBuilder: (_, _, _) =>
+                    errorBuilder: (_) =>
                         const Icon(Icons.broken_image_outlined),
-                    loadingBuilder: (context, child, chunk) => chunk == null
-                        ? child
-                        : const Center(
-                            child: SizedBox(
-                              width: 18,
-                              height: 18,
-                              child:
-                                  CircularProgressIndicator(strokeWidth: 2),
-                            ),
-                          ),
+                    loadingBuilder: (_) => const Center(
+                      child: SizedBox(
+                        width: 18,
+                        height: 18,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      ),
+                    ),
                   ),
           ),
           if (item.isRawOnly)

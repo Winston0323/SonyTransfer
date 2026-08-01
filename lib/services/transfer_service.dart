@@ -103,66 +103,85 @@ class TransferService {
   Stream<TransferResult> transferAll(
     List<CameraItem> items, {
     void Function(TransferProgress progress)? onProgress,
-  }) async* {
-    final dir = await destinationDirectory();
-    _sessionBytes = 0;
-    _lastEmitMs = 0;
-    _clock
-      ..reset()
-      ..start();
+  }) {
+    final controller = StreamController<TransferResult>();
+    unawaited(_runTransfer(items, onProgress, controller));
+    return controller.stream;
+  }
 
-    Future<TransferResult>? pendingGallery;
-
-    for (final item in items) {
-      if (_cancelled) break;
-
-      if (item.isRawOnly) {
-        if (pendingGallery != null) {
-          yield await pendingGallery;
-          pendingGallery = null;
-        }
-        yield TransferResult(
-          item,
-          TransferOutcome.skippedRaw,
-          detail: 'raw only — camera serves no full-size JPEG',
-        );
-        continue;
-      }
-
-      final resource = item.original!;
-      final file = File(p.join(dir.path, item.fileName));
-
-      if (await file.exists() &&
-          resource.byteSize != null &&
-          await file.length() == resource.byteSize) {
-        if (pendingGallery != null) {
-          yield await pendingGallery;
-          pendingGallery = null;
-        }
-        yield TransferResult(item, TransferOutcome.skippedExisting);
-        continue;
-      }
-
-      try {
-        await _download(item, resource, file, onProgress);
-      } catch (e) {
-        if (pendingGallery != null) {
-          yield await pendingGallery;
-          pendingGallery = null;
-        }
-        if (await file.exists()) await file.delete();
-        yield TransferResult(item, TransferOutcome.failed, detail: '$e');
-        continue;
-      }
-
-      // The bytes are down. Report the previous shot's gallery outcome now
-      // that this one's download has caught up with it, and hand this shot's
-      // own copy to the background so it overlaps with the next download.
-      if (pendingGallery != null) yield await pendingGallery;
-      pendingGallery = _insertIntoGallery(item, file);
+  Future<void> _runTransfer(
+    List<CameraItem> items,
+    void Function(TransferProgress progress)? onProgress,
+    StreamController<TransferResult> controller,
+  ) async {
+    // Keeps results in the same order as [items] while letting each shot's
+    // gallery copy run in the background: the future itself starts the
+    // moment a download finishes, but this chain only controls *when its
+    // result is emitted* — so a quick gallery copy is reported to the caller
+    // as soon as it is actually done, rather than sitting unreported until
+    // however long the next shot's download happens to take (which used to
+    // leave the "done" counter looking stuck, then jumping).
+    var emitted = Future<void>.value();
+    void enqueue(Future<TransferResult> result) {
+      emitted = emitted.then((_) async => controller.add(await result));
     }
 
-    if (pendingGallery != null) yield await pendingGallery;
+    try {
+      final dir = await destinationDirectory();
+      _sessionBytes = 0;
+      _lastEmitMs = 0;
+      _clock
+        ..reset()
+        ..start();
+
+      for (final item in items) {
+        if (_cancelled) break;
+
+        if (item.isRawOnly) {
+          enqueue(
+            Future.value(
+              TransferResult(
+                item,
+                TransferOutcome.skippedRaw,
+                detail: 'raw only — camera serves no full-size JPEG',
+              ),
+            ),
+          );
+          continue;
+        }
+
+        final resource = item.original!;
+        final file = File(p.join(dir.path, item.fileName));
+
+        if (await file.exists() &&
+            resource.byteSize != null &&
+            await file.length() == resource.byteSize) {
+          enqueue(
+            Future.value(TransferResult(item, TransferOutcome.skippedExisting)),
+          );
+          continue;
+        }
+
+        try {
+          await _download(item, resource, file, onProgress);
+        } catch (e) {
+          if (await file.exists()) await file.delete();
+          enqueue(
+            Future.value(
+              TransferResult(item, TransferOutcome.failed, detail: '$e'),
+            ),
+          );
+          continue;
+        }
+
+        // The bytes are down; hand the copy into the gallery to the
+        // background so it overlaps with the next download.
+        enqueue(_insertIntoGallery(item, file));
+      }
+    } finally {
+      await emitted;
+      await controller.close();
+    }
   }
 
   Future<TransferResult> _insertIntoGallery(CameraItem item, File file) async {

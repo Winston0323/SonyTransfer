@@ -39,6 +39,19 @@ If **Scan** finds nothing, the hint names the cause (Wi-Fi off, Location off,
 permission refused, or rate-limited). Use **Open Location settings** /
 **Open app settings** / **Open Wi-Fi settings** under the hint.
 
+The SSID and password only need to be typed once. With **Auto-connect** on
+(the default), the app rescans every ten seconds while idle, and joins by
+itself as soon as it sees that remembered network again — so the usual
+routine is just "turn the camera's Send to Smartphone mode on" and wait.
+Turning it off goes back to scanning and joining only on demand.
+
+The app also notices the other direction: while connected, browsing, or
+transferring, it polls every five seconds for the camera's Wi-Fi still being
+associated. Two misses in a row — the camera switched off, walked out of
+range, or the phone drifted onto another network — send the app straight
+back to the setup screen (cancelling an in-progress transfer first) rather
+than leaving a now-unreachable session on screen.
+
 By default transferred shots are added to a **SonyTransfer** album in the Photos
 app. Tap **Choose folder** (shown once connected) to redirect them anywhere
 reachable through Android's folder picker instead — an SD card, `Downloads`, a
@@ -74,6 +87,12 @@ Tiles load the camera's `_SM` (640×480) rendition rather than the `_TN` thumbna
 which is too small to judge a shot on a modern phone screen; the preview uses
 `_LRG`. Both are a fraction of the ~20MB original, and the grid only fetches what
 scrolls into view.
+
+Every thumbnail and preview is cached to disk the first time it is fetched, so
+scrolling away and back — or reconnecting in a later session — costs nothing
+further; and no more than 4 are ever requested from the camera at once, since
+its embedded web server queues up (and each request slows down) if the grid
+asks for a dozen at the same moment while scrolling fast.
 
 ### Finding the camera
 
