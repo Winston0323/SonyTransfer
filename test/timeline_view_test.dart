@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:sony_transfer/models/camera_item.dart';
 import 'package:sony_transfer/models/timeline.dart';
+import 'package:sony_transfer/widgets/preview_page.dart';
 import 'package:sony_transfer/widgets/timeline_view.dart';
 
 /// Dates are kept far in the past on purpose: recent ones render as "Today" or
@@ -77,7 +78,7 @@ void main() {
     expect(tapped, ['a.JPG']);
     // Selecting must not also open the preview.
     await tester.pumpAndSettle();
-    expect(find.byType(Dialog), findsNothing);
+    expect(find.byType(PreviewPage), findsNothing);
   });
 
   testWidgets('long-pressing a shot selects it too', (tester) async {
@@ -143,7 +144,8 @@ void main() {
     expect(find.byIcon(Icons.check_circle), findsOneWidget);
   });
 
-  testWidgets('tapping a shot opens the big preview', (tester) async {
+  testWidgets('tapping a shot opens the full-screen preview page',
+      (tester) async {
     await _pump(
       tester,
       items: [_shot('a.JPG', at: DateTime(2020, 5, 30, 9))],
@@ -154,8 +156,32 @@ void main() {
     await tester.tap(find.byType(Image));
     await tester.pumpAndSettle();
 
-    expect(find.byType(Dialog), findsOneWidget);
+    expect(find.byType(PreviewPage), findsOneWidget);
     expect(find.text('a.JPG'), findsOneWidget);
+    expect(find.text('1 / 1'), findsOneWidget);
+  });
+
+  testWidgets('swiping the preview moves to the next shot in grid order',
+      (tester) async {
+    await _pump(
+      tester,
+      items: [
+        _shot('a.JPG', at: DateTime(2020, 5, 30, 9)),
+        _shot('b.JPG', at: DateTime(2020, 5, 30, 8)),
+      ],
+      selected: {},
+      onToggle: (_) {},
+    );
+
+    await tester.tap(find.byType(Image).first);
+    await tester.pumpAndSettle();
+    expect(find.text('a.JPG'), findsOneWidget);
+
+    await tester.drag(find.byType(PageView), const Offset(-600, 0));
+    await tester.pumpAndSettle();
+
+    expect(find.text('b.JPG'), findsOneWidget);
+    expect(find.text('2 / 2'), findsOneWidget);
   });
 
   testWidgets('the preview can select the shot it is showing', (tester) async {

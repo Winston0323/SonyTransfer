@@ -12,6 +12,10 @@
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/>
     <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES"/>
+    <!-- Backs the WifiManager.WifiLock acquired for the length of a camera
+         connection, which keeps the radio out of its power-saving sleep cycle
+         during a transfer. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK"/>
 
     <application
         android:label="Sony Transfer"

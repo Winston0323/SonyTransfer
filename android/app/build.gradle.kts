@@ -42,3 +42,10 @@ android {
 flutter {
     source = "../.."
 }
+
+dependencies {
+    // DocumentFile wraps the SAF tree URI the user picks as a destination
+    // folder, so it can be written to with ordinary streams instead of
+    // hand-rolled ContentResolver/DocumentsContract calls.
+    implementation("androidx.documentfile:documentfile:1.0.1")
+}

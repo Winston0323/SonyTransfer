@@ -47,6 +47,26 @@ class WifiJoinResult {
   final String? message;
 }
 
+/// Snapshot of the active Wi-Fi link's radio characteristics.
+class WifiLinkInfo {
+  const WifiLinkInfo({this.linkSpeedMbps, this.rssiDbm, this.frequencyMhz});
+
+  final int? linkSpeedMbps;
+
+  /// Signal strength. Roughly: -50 excellent, -67 good, -75 weak, -80 barely
+  /// usable.
+  final int? rssiDbm;
+
+  final int? frequencyMhz;
+
+  /// 2.4GHz is where every Sony "Send to Smartphone" access point broadcasts,
+  /// so seeing anything else here would be the surprise worth a comment.
+  bool get isTwoPointFourGhz =>
+      frequencyMhz != null && frequencyMhz! < 3000;
+
+  bool get isWeakSignal => rssiDbm != null && rssiDbm! <= -75;
+}
+
 /// How [NetworkBinding.disconnectWifi] left the camera network.
 enum WifiDisconnectResult {
   /// This app owned the link and Android dropped it.
@@ -189,6 +209,31 @@ class NetworkBinding {
       return null;
     } on MissingPluginException {
       return null;
+    }
+  }
+
+  /// PHY rate, signal strength, and band of the active Wi-Fi link, when
+  /// Android is willing to report them (needs the same location access as
+  /// [currentWifiSsid] on Android 8+).
+  ///
+  /// A link speed far below another device's is the app's best evidence of a
+  /// radio/antenna gap rather than something the transfer code can fix; RSSI
+  /// tells the difference between that and just standing too far from the
+  /// camera.
+  static Future<WifiLinkInfo> wifiLinkInfo() async {
+    try {
+      final raw =
+          await _channel.invokeMethod<Map<dynamic, dynamic>>('wifiLinkInfo');
+      if (raw == null) return const WifiLinkInfo();
+      return WifiLinkInfo(
+        linkSpeedMbps: raw['linkSpeedMbps'] as int?,
+        rssiDbm: raw['rssiDbm'] as int?,
+        frequencyMhz: raw['frequencyMhz'] as int?,
+      );
+    } on PlatformException {
+      return const WifiLinkInfo();
+    } on MissingPluginException {
+      return const WifiLinkInfo();
     }
   }
 

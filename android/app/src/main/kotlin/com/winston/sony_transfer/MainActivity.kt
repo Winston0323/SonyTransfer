@@ -11,6 +11,7 @@ import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
+import android.net.Uri
 import android.net.wifi.ScanResult
 import android.net.wifi.WifiConfiguration
 import android.net.wifi.WifiManager
@@ -18,13 +19,16 @@ import android.net.wifi.WifiNetworkSpecifier
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import android.provider.Settings
 import android.util.Log
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.documentfile.provider.DocumentFile
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
+import java.io.File
 import java.net.Inet4Address
 import java.net.InetAddress
 import java.nio.ByteBuffer
@@ -40,9 +44,36 @@ class MainActivity : FlutterActivity() {
     private var pendingScanResult: MethodChannel.Result? = null
     private var scanCallback: WifiManager.ScanResultsCallback? = null
 
+    /**
+     * Held only while bound to the camera. Without it several OEMs let the Wi-Fi
+     * radio drop into a power-saving mode as soon as the screen dims, which is a
+     * far bigger drag on throughput than anything in this app's own I/O — and it
+     * hits cheaper phones much harder than a tablet that never bothers throttling.
+     */
+    private var wifiLock: WifiManager.WifiLock? = null
+
+    /**
+     * Held alongside [wifiLock]. Some OEMs suspend background CPU work (and with
+     * it, this app's socket reads) the moment the screen times out mid-transfer —
+     * a battery-saving habit tablets are less aggressive about. A partial wake
+     * lock keeps the CPU itself running so a long transfer survives the screen
+     * going dark.
+     */
+    private var cpuLock: PowerManager.WakeLock? = null
+
+    /** Pending result for a folder pick, resolved from [onActivityResult]. */
+    private var folderPickResult: MethodChannel.Result? = null
+
+    private val prefs by lazy {
+        applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    }
+
     companion object {
         private const val TAG = "SonyTransferWifi"
         private const val SCAN_PERMISSION_REQUEST = 1001
+        private const val FOLDER_PICK_REQUEST = 1002
+        private const val PREFS_NAME = "sony_transfer_prefs"
+        private const val PREF_DESTINATION_URI = "destination_tree_uri"
     }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
@@ -89,12 +120,24 @@ class MainActivity : FlutterActivity() {
                         result.success(true)
                     }
                     "currentWifiSsid" -> result.success(currentWifiSsid())
+                    "wifiLinkInfo" -> result.success(wifiLinkInfo())
                     "unbind" -> {
                         cm.bindProcessToNetwork(null)
                         result.success(true)
                     }
                     "disconnectWifi" -> result.success(disconnectWifi(cm))
                     "wifiGateway" -> result.success(wifiGateway(cm))
+                    "pickDestinationFolder" -> pickDestinationFolder(result)
+                    "currentDestinationName" -> result.success(currentDestinationName())
+                    "clearDestinationFolder" -> {
+                        clearDestinationFolder()
+                        result.success(true)
+                    }
+                    "saveFileToDestination" -> {
+                        val sourcePath = call.argument<String>("sourcePath")
+                        val fileName = call.argument<String>("fileName")
+                        result.success(saveFileToDestination(sourcePath, fileName))
+                    }
                     else -> result.notImplemented()
                 }
             }
@@ -102,6 +145,7 @@ class MainActivity : FlutterActivity() {
 
     override fun onDestroy() {
         clearScanListeners()
+        releaseWifiLock()
         super.onDestroy()
     }
 
@@ -113,8 +157,223 @@ class MainActivity : FlutterActivity() {
     @Suppress("DEPRECATION")
     private fun bindToWifi(cm: ConnectivityManager): Boolean {
         val wifi = wifiNetwork(cm) ?: return false
-        return cm.bindProcessToNetwork(wifi)
+        val bound = cm.bindProcessToNetwork(wifi)
+        if (bound) acquireWifiLock()
+        return bound
     }
+
+    /**
+     * WIFI_MODE_FULL_LOW_LATENCY (API 29+) keeps the radio at full power the same
+     * way WIFI_MODE_FULL_HIGH_PERF does, but is the mode Android actually still
+     * honours on newer OEM skins that have started quietly ignoring high-perf.
+     * Falling back to high-perf below API 29 covers the rest. Either way, this
+     * asks the platform not to let the radio sleep between beacons to save
+     * battery — invisible on a plugged-in tablet, but a real cut to a phone's
+     * throughput.
+     */
+    @Suppress("DEPRECATION")
+    private fun acquireWifiLock() {
+        if (wifiLock?.isHeld != true) {
+            try {
+                val wifiManager =
+                    applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+                val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+                } else {
+                    WifiManager.WIFI_MODE_FULL_HIGH_PERF
+                }
+                val lock = wifiManager.createWifiLock(mode, "$packageName:transfer")
+                lock.setReferenceCounted(false)
+                lock.acquire()
+                wifiLock = lock
+                Log.i(TAG, "wifi lock acquired (mode=$mode)")
+            } catch (e: Exception) {
+                Log.w(TAG, "wifi lock acquire failed", e)
+            }
+        }
+
+        if (cpuLock?.isHeld != true) {
+            try {
+                val powerManager =
+                    applicationContext.getSystemService(Context.POWER_SERVICE) as PowerManager
+                val lock = powerManager.newWakeLock(
+                    PowerManager.PARTIAL_WAKE_LOCK,
+                    "$packageName:transfer",
+                )
+                lock.setReferenceCounted(false)
+                // A stuck lock would otherwise drain the battery well past any
+                // real transfer; nothing in this app should ever hold it this long.
+                lock.acquire(30 * 60 * 1000L)
+                cpuLock = lock
+                Log.i(TAG, "cpu wake lock acquired")
+            } catch (e: Exception) {
+                Log.w(TAG, "cpu wake lock acquire failed", e)
+            }
+        }
+    }
+
+    private fun releaseWifiLock() {
+        wifiLock?.let { lock ->
+            try {
+                if (lock.isHeld) lock.release()
+                Log.i(TAG, "wifi lock released")
+            } catch (e: Exception) {
+                Log.w(TAG, "wifi lock release failed", e)
+            }
+        }
+        wifiLock = null
+
+        cpuLock?.let { lock ->
+            try {
+                if (lock.isHeld) lock.release()
+                Log.i(TAG, "cpu wake lock released")
+            } catch (e: Exception) {
+                Log.w(TAG, "cpu wake lock release failed", e)
+            }
+        }
+        cpuLock = null
+    }
+
+    /**
+     * PHY rate, signal strength, and band for the active Wi-Fi link, so a slow
+     * transfer can be told apart from a weak or congested one. Any of these can
+     * be null when Android will not report it.
+     */
+    @Suppress("DEPRECATION")
+    private fun wifiLinkInfo(): Map<String, Int?> {
+        val wifiManager =
+            applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+        val info = wifiManager.connectionInfo
+        return mapOf(
+            "linkSpeedMbps" to info?.linkSpeed?.takeIf { it > 0 },
+            "rssiDbm" to info?.rssi?.takeIf { it != 0 },
+            "frequencyMhz" to info?.frequency?.takeIf { it > 0 },
+        )
+    }
+
+    /**
+     * Lets the user redirect saved shots to any folder reachable through
+     * Android's document picker — an SD card, Downloads, a synced cloud folder —
+     * instead of the fixed Photos album this app defaults to.
+     */
+    private fun pickDestinationFolder(result: MethodChannel.Result) {
+        if (folderPickResult != null) {
+            result.error("busy", "A folder picker is already open.", null)
+            return
+        }
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).addFlags(
+            Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+                Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION,
+        )
+        try {
+            folderPickResult = result
+            startActivityForResult(intent, FOLDER_PICK_REQUEST)
+        } catch (e: Exception) {
+            Log.w(TAG, "folder picker unavailable", e)
+            folderPickResult = null
+            result.success(mapOf("ok" to false, "name" to currentDestinationName()))
+        }
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != FOLDER_PICK_REQUEST) return
+        val pending = folderPickResult ?: return
+        folderPickResult = null
+
+        val uri = data?.data
+        if (resultCode != RESULT_OK || uri == null) {
+            pending.success(mapOf("ok" to false, "name" to currentDestinationName()))
+            return
+        }
+
+        try {
+            contentResolver.takePersistableUriPermission(
+                uri,
+                Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
+            )
+            prefs.edit().putString(PREF_DESTINATION_URI, uri.toString()).apply()
+            Log.i(TAG, "destination folder set: $uri")
+            pending.success(mapOf("ok" to true, "name" to displayNameFor(uri)))
+        } catch (e: Exception) {
+            Log.w(TAG, "could not persist folder permission", e)
+            pending.success(mapOf("ok" to false, "name" to currentDestinationName()))
+        }
+    }
+
+    /** The chosen folder's tree URI, or null if none is set or its grant expired. */
+    private fun destinationUri(): Uri? {
+        val raw = prefs.getString(PREF_DESTINATION_URI, null) ?: return null
+        val uri = Uri.parse(raw)
+        val stillGranted = contentResolver.persistedUriPermissions.any {
+            it.uri == uri && it.isReadPermission && it.isWritePermission
+        }
+        if (!stillGranted) {
+            prefs.edit().remove(PREF_DESTINATION_URI).apply()
+            return null
+        }
+        return uri
+    }
+
+    private fun currentDestinationName(): String? =
+        destinationUri()?.let { displayNameFor(it) }
+
+    private fun displayNameFor(uri: Uri): String =
+        DocumentFile.fromTreeUri(this, uri)?.name ?: uri.lastPathSegment ?: "Selected folder"
+
+    private fun clearDestinationFolder() {
+        destinationUri()?.let { uri ->
+            try {
+                contentResolver.releasePersistableUriPermission(
+                    uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
+                )
+            } catch (e: Exception) {
+                Log.w(TAG, "releasePersistableUriPermission failed", e)
+            }
+        }
+        prefs.edit().remove(PREF_DESTINATION_URI).apply()
+    }
+
+    /**
+     * Copies an already-downloaded file at [sourcePath] into the chosen folder
+     * as [fileName], overwriting any earlier copy. Dart hands over a finished
+     * local file rather than streaming bytes over the channel, so this is one
+     * cheap call per shot instead of one per chunk.
+     */
+    private fun saveFileToDestination(sourcePath: String?, fileName: String?): Map<String, Any?> {
+        if (sourcePath.isNullOrEmpty() || fileName.isNullOrEmpty()) {
+            return mapOf("ok" to false, "reason" to "bad_args")
+        }
+        val tree = destinationUri()?.let { DocumentFile.fromTreeUri(this, it) }
+            ?: return mapOf("ok" to false, "reason" to "no_folder")
+
+        return try {
+            tree.findFile(fileName)?.delete()
+            val target = tree.createFile(mimeTypeFor(fileName), fileName)
+                ?: return mapOf("ok" to false, "reason" to "create_failed")
+
+            val opened = contentResolver.openOutputStream(target.uri)?.use { out ->
+                File(sourcePath).inputStream().use { input -> input.copyTo(out) }
+                true
+            } ?: false
+
+            if (!opened) target.delete()
+            mapOf("ok" to opened, "reason" to if (opened) null else "open_failed")
+        } catch (e: Exception) {
+            Log.w(TAG, "saveFileToDestination failed", e)
+            mapOf("ok" to false, "reason" to e.javaClass.simpleName)
+        }
+    }
+
+    private fun mimeTypeFor(fileName: String): String =
+        when (fileName.substringAfterLast('.', "").lowercase()) {
+            "jpg", "jpeg" -> "image/jpeg"
+            "png" -> "image/png"
+            "heic" -> "image/heic"
+            else -> "application/octet-stream"
+        }
 
     override fun onRequestPermissionsResult(
         requestCode: Int,
@@ -419,6 +678,7 @@ class MainActivity : FlutterActivity() {
             override fun onAvailable(network: Network) {
                 Log.i(TAG, "specifier onAvailable")
                 cm.bindProcessToNetwork(network)
+                acquireWifiLock()
                 completeJoin(true)
             }
 
@@ -435,6 +695,7 @@ class MainActivity : FlutterActivity() {
 
             override fun onLost(network: Network) {
                 cm.bindProcessToNetwork(null)
+                releaseWifiLock()
             }
         }
 
@@ -504,6 +765,7 @@ class MainActivity : FlutterActivity() {
     @Suppress("DEPRECATION")
     private fun disconnectWifi(cm: ConnectivityManager): String {
         cm.bindProcessToNetwork(null)
+        releaseWifiLock()
 
         val owned = cameraCallback != null
         releaseOwnedNetwork(cm)

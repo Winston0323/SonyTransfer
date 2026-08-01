@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../models/camera_item.dart';
 import '../models/timeline.dart';
 import '../services/transfer_service.dart';
+import 'preview_page.dart';
 
 /// Shots grouped by capture day, newest first, with tap-to-select tiles.
 class TimelineView extends StatelessWidget {
@@ -28,6 +29,14 @@ class TimelineView extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // Flattened in display order, so swiping through the full-screen preview
+    // steps through shots in exactly the order the grid shows them — day
+    // sections in sequence, each section's own order within it.
+    final flatItems = [for (final section in sections) ...section.items];
+    final indexById = {
+      for (var i = 0; i < flatItems.length; i++) flatItems[i].id: i,
+    };
+
     return CustomScrollView(
       slivers: [
         for (final section in sections) ...[
@@ -55,6 +64,16 @@ class TimelineView extends StatelessWidget {
                   selected: selected.contains(item.id),
                   outcome: outcomes[item.id],
                   onToggle: () => onToggle(item),
+                  onOpenPreview: () => Navigator.of(context).push(
+                    MaterialPageRoute<void>(
+                      builder: (context) => PreviewPage(
+                        items: flatItems,
+                        initialIndex: indexById[item.id]!,
+                        selected: selected,
+                        onToggle: onToggle,
+                      ),
+                    ),
+                  ),
                 );
               },
             ),
@@ -147,12 +166,14 @@ class _ShotTile extends StatelessWidget {
     required this.selected,
     required this.outcome,
     required this.onToggle,
+    required this.onOpenPreview,
   });
 
   final CameraItem item;
   final bool selected;
   final TransferOutcome? outcome;
   final VoidCallback onToggle;
+  final VoidCallback onOpenPreview;
 
   @override
   Widget build(BuildContext context) {
@@ -160,7 +181,7 @@ class _ShotTile extends StatelessWidget {
     final url = item.thumbnail?.url;
 
     return GestureDetector(
-      onTap: () => _showPreview(context),
+      onTap: onOpenPreview,
       // Long-press picks shots without aiming for the corner box, the way a
       // gallery app does.
       onLongPress: item.isRawOnly ? null : onToggle,
@@ -222,19 +243,6 @@ class _ShotTile extends StatelessWidget {
       ),
     );
   }
-
-  void _showPreview(BuildContext context) {
-    if (item.preview == null) return;
-
-    showDialog<void>(
-      context: context,
-      builder: (context) => _PreviewDialog(
-        item: item,
-        selected: selected,
-        onToggle: item.isRawOnly ? null : onToggle,
-      ),
-    );
-  }
 }
 
 /// The tap target that picks a shot, kept distinct from the tile so tapping the
@@ -267,91 +275,6 @@ class _SelectBox extends StatelessWidget {
             color: selected ? theme.colorScheme.primary : Colors.white,
           ),
         ),
-      ),
-    );
-  }
-}
-
-/// Full-size preview, with the same select action so a shot can be picked after
-/// a proper look at it.
-class _PreviewDialog extends StatefulWidget {
-  const _PreviewDialog({
-    required this.item,
-    required this.selected,
-    required this.onToggle,
-  });
-
-  final CameraItem item;
-  final bool selected;
-
-  /// Null for raw shots, which cannot be transferred.
-  final VoidCallback? onToggle;
-
-  @override
-  State<_PreviewDialog> createState() => _PreviewDialogState();
-}
-
-class _PreviewDialogState extends State<_PreviewDialog> {
-  late bool _selected = widget.selected;
-
-  void _toggle() {
-    widget.onToggle!();
-    setState(() => _selected = !_selected);
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final item = widget.item;
-
-    return Dialog(
-      insetPadding: const EdgeInsets.all(12),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Flexible(
-            child: InteractiveViewer(
-              child: Image.network(
-                item.preview!.url,
-                fit: BoxFit.contain,
-                errorBuilder: (_, _, _) => const Padding(
-                  padding: EdgeInsets.all(48),
-                  child: Icon(Icons.broken_image_outlined, size: 48),
-                ),
-                loadingBuilder: (context, child, chunk) => chunk == null
-                    ? child
-                    : const Padding(
-                        padding: EdgeInsets.all(48),
-                        child: CircularProgressIndicator(),
-                      ),
-              ),
-            ),
-          ),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 12, 8, 8),
-            child: Row(
-              children: [
-                Expanded(
-                  child: Text(
-                    item.isRawOnly
-                        ? '${item.fileName} · raw, preview only'
-                        : item.fileName,
-                    style: theme.textTheme.bodySmall,
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                ),
-                if (widget.onToggle != null)
-                  TextButton.icon(
-                    onPressed: _toggle,
-                    icon: Icon(
-                      _selected ? Icons.check_circle : Icons.circle_outlined,
-                    ),
-                    label: Text(_selected ? 'Selected' : 'Select'),
-                  ),
-              ],
-            ),
-          ),
-        ],
       ),
     );
   }

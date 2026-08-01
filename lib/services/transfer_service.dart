@@ -7,6 +7,7 @@ import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
 import '../models/camera_item.dart';
+import 'destination_folder.dart';
 
 enum TransferOutcome { saved, skippedExisting, skippedRaw, failed }
 
@@ -88,7 +89,14 @@ class TransferService {
     return dir;
   }
 
-  /// Transfers [items] one at a time, reporting each result as it lands.
+  /// Transfers [items] one download at a time, reporting each result as it
+  /// lands.
+  ///
+  /// Filing a finished shot into the gallery is disk I/O, not network I/O, so
+  /// it runs while the *next* shot downloads instead of serializing the two.
+  /// On phones with slower storage than the network link, that copy can cost
+  /// as much wall-clock time as the download itself; overlapping it is what
+  /// keeps the network saturated instead of idling between shots.
   ///
   /// [onProgress] reports the shot currently in flight, throttled to
   /// [_progressInterval] so the UI cannot starve the download.
@@ -103,10 +111,16 @@ class TransferService {
       ..reset()
       ..start();
 
+    Future<TransferResult>? pendingGallery;
+
     for (final item in items) {
-      if (_cancelled) return;
+      if (_cancelled) break;
 
       if (item.isRawOnly) {
+        if (pendingGallery != null) {
+          yield await pendingGallery;
+          pendingGallery = null;
+        }
         yield TransferResult(
           item,
           TransferOutcome.skippedRaw,
@@ -121,18 +135,43 @@ class TransferService {
       if (await file.exists() &&
           resource.byteSize != null &&
           await file.length() == resource.byteSize) {
+        if (pendingGallery != null) {
+          yield await pendingGallery;
+          pendingGallery = null;
+        }
         yield TransferResult(item, TransferOutcome.skippedExisting);
         continue;
       }
 
       try {
         await _download(item, resource, file, onProgress);
-        await _addToGallery(file);
-        yield TransferResult(item, TransferOutcome.saved);
       } catch (e) {
+        if (pendingGallery != null) {
+          yield await pendingGallery;
+          pendingGallery = null;
+        }
         if (await file.exists()) await file.delete();
         yield TransferResult(item, TransferOutcome.failed, detail: '$e');
+        continue;
       }
+
+      // The bytes are down. Report the previous shot's gallery outcome now
+      // that this one's download has caught up with it, and hand this shot's
+      // own copy to the background so it overlaps with the next download.
+      if (pendingGallery != null) yield await pendingGallery;
+      pendingGallery = _insertIntoGallery(item, file);
+    }
+
+    if (pendingGallery != null) yield await pendingGallery;
+  }
+
+  Future<TransferResult> _insertIntoGallery(CameraItem item, File file) async {
+    try {
+      await _addToGallery(file);
+      return TransferResult(item, TransferOutcome.saved);
+    } catch (e) {
+      if (await file.exists()) await file.delete();
+      return TransferResult(item, TransferOutcome.failed, detail: '$e');
     }
   }
 
@@ -214,6 +253,18 @@ class TransferService {
   Future<void> _addToGallery(File file) async {
     final custom = _saveToGallery;
     if (custom != null) return custom(file);
+
+    final folderName = await DestinationFolder.currentName();
+    if (folderName != null) {
+      final saved = await DestinationFolder.save(
+        sourcePath: file.path,
+        fileName: p.basename(file.path),
+      );
+      if (saved) return;
+      // The chosen folder may have gone away mid-batch (SD card pulled, a
+      // synced cloud folder revoked). Landing the shot in Photos instead of
+      // losing it beats failing the whole transfer over one bad folder.
+    }
 
     if (!await Gal.hasAccess()) {
       await Gal.requestAccess();

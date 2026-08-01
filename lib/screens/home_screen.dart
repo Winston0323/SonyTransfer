@@ -6,6 +6,7 @@ import 'package:flutter/services.dart';
 
 import '../models/camera_item.dart';
 import '../models/timeline.dart';
+import '../services/destination_folder.dart';
 import '../services/network_binding.dart';
 import '../services/saved_wifi_credentials.dart';
 import '../services/sony_camera_client.dart';
@@ -13,6 +14,16 @@ import '../services/transfer_service.dart';
 import '../widgets/timeline_view.dart';
 
 enum _Stage { idle, connecting, connected, transferring, finished }
+
+/// Shrinks a [TextButton] to its text size. The default Material tap target
+/// is generous enough that a row of these next to a status line is what tips
+/// the setup panel into overflowing on shorter screens.
+final ButtonStyle _compactButtonStyle = TextButton.styleFrom(
+  minimumSize: Size.zero,
+  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+  visualDensity: VisualDensity.compact,
+);
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -53,17 +64,45 @@ class _HomeScreenState extends State<HomeScreen> {
   String? _error;
   String _status = '';
 
+  /// Wi-Fi radio characteristics, when Android will report them. A phone stuck
+  /// at a fraction of a tablet's speed on the same camera almost always shows
+  /// up here first — a radio/antenna gap or a weak signal, not something the
+  /// download code controls.
+  WifiLinkInfo _linkInfo = const WifiLinkInfo();
+
   /// Kept out of [setState] so a progress tick repaints only the bottom bar
   /// rather than the whole screen, including the shot list.
   final ValueNotifier<TransferProgress?> _progress = ValueNotifier(null);
 
   int _done = 0;
-  String? _savePath;
+
+  /// Folder the user redirected saves to via [DestinationFolder.pick], or
+  /// null when saving to the default Photos album.
+  String? _destinationFolderName;
 
   @override
   void initState() {
     super.initState();
     _restoreCredentials();
+    _loadDestinationFolder();
+  }
+
+  Future<void> _loadDestinationFolder() async {
+    final name = await DestinationFolder.currentName();
+    if (!mounted) return;
+    setState(() => _destinationFolderName = name);
+  }
+
+  Future<void> _pickDestinationFolder() async {
+    final result = await DestinationFolder.pick();
+    if (!mounted) return;
+    setState(() => _destinationFolderName = result.name);
+  }
+
+  Future<void> _clearDestinationFolder() async {
+    await DestinationFolder.clear();
+    if (!mounted) return;
+    setState(() => _destinationFolderName = null);
   }
 
   Future<void> _restoreCredentials() async {
@@ -297,11 +336,11 @@ class _HomeScreenState extends State<HomeScreen> {
       // own display, so browsing goes ahead either way.
       await client.transferStart();
 
-      final dir = await _transfer.destinationDirectory();
+      final linkInfo = await NetworkBinding.wifiLinkInfo();
       if (!mounted) return;
 
       setState(() {
-        _savePath = dir.path;
+        _linkInfo = linkInfo;
         _stage = _Stage.connected;
         _loading = true;
         _status = 'Loading newest shots…';
@@ -380,6 +419,11 @@ class _HomeScreenState extends State<HomeScreen> {
       _error = null;
       _status = 'Transferring…';
     });
+    unawaited(
+      NetworkBinding.wifiLinkInfo().then((info) {
+        if (mounted) setState(() => _linkInfo = info);
+      }),
+    );
 
     final stream = _transfer.transferAll(
       queue,
@@ -448,7 +492,6 @@ class _HomeScreenState extends State<HomeScreen> {
       _selected.clear();
       _outcomes.clear();
       _cameraName = null;
-      _savePath = null;
       _error = null;
       _status = switch (left) {
         WifiDisconnectResult.released => 'Left the camera Wi-Fi.',
@@ -525,7 +568,9 @@ class _HomeScreenState extends State<HomeScreen> {
             onOpenAppSettings: NetworkBinding.openAppSettings,
             status: _status,
             error: _error,
-            savePath: _savePath,
+            destinationFolderName: _destinationFolderName,
+            onPickDestinationFolder: _pickDestinationFolder,
+            onClearDestinationFolder: _clearDestinationFolder,
             itemCount: _items.length,
             transferable: _transferable,
             selectedCount: _selected.length,
@@ -554,6 +599,7 @@ class _HomeScreenState extends State<HomeScreen> {
             selectedCount: _selected.length,
             done: _done,
             progress: _progress,
+            linkInfo: _linkInfo,
             onDownload: _downloadSelected,
             onCancel: _transfer.cancel,
           ),
@@ -585,7 +631,9 @@ class _StatusPanel extends StatelessWidget {
     required this.onOpenAppSettings,
     required this.status,
     required this.error,
-    required this.savePath,
+    required this.destinationFolderName,
+    required this.onPickDestinationFolder,
+    required this.onClearDestinationFolder,
     required this.itemCount,
     required this.transferable,
     required this.selectedCount,
@@ -614,7 +662,12 @@ class _StatusPanel extends StatelessWidget {
   final VoidCallback onOpenAppSettings;
   final String status;
   final String? error;
-  final String? savePath;
+
+  /// Folder saves are redirected to, or null when using the default Photos
+  /// album.
+  final String? destinationFolderName;
+  final VoidCallback onPickDestinationFolder;
+  final VoidCallback onClearDestinationFolder;
   final int itemCount;
   final int transferable;
   final int selectedCount;
@@ -805,6 +858,36 @@ class _StatusPanel extends StatelessWidget {
               'Connected at ${hostController.text}',
               style: theme.textTheme.bodySmall?.copyWith(color: theme.hintColor),
             ),
+            const SizedBox(height: 4),
+            Row(
+              children: [
+                Icon(Icons.folder_outlined, size: 16, color: theme.hintColor),
+                const SizedBox(width: 6),
+                Expanded(
+                  child: Text(
+                    destinationFolderName == null
+                        ? 'Saving to the Photos app (SonyTransfer album)'
+                        : 'Saving to "$destinationFolderName"',
+                    style: theme.textTheme.bodySmall
+                        ?.copyWith(color: theme.hintColor),
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+                TextButton(
+                  onPressed: onPickDestinationFolder,
+                  style: _compactButtonStyle,
+                  child: Text(
+                    destinationFolderName == null ? 'Choose folder' : 'Change',
+                  ),
+                ),
+                if (destinationFolderName != null)
+                  TextButton(
+                    onPressed: onClearDestinationFolder,
+                    style: _compactButtonStyle,
+                    child: const Text('Reset'),
+                  ),
+              ],
+            ),
           ],
           if (connected && itemCount > 0) ...[
             const SizedBox(height: 8),
@@ -820,14 +903,6 @@ class _StatusPanel extends StatelessWidget {
           if (status.isNotEmpty) ...[
             const SizedBox(height: 8),
             Text(status, style: theme.textTheme.bodySmall),
-          ],
-          if (savePath != null && connected) ...[
-            const SizedBox(height: 4),
-            Text(
-              'Saving to $savePath and the SonyTransfer album',
-              style: theme.textTheme.bodySmall
-                  ?.copyWith(color: theme.hintColor),
-            ),
           ],
           if (error != null) ...[
             const SizedBox(height: 12),
@@ -961,6 +1036,7 @@ class _BottomBar extends StatelessWidget {
     required this.selectedCount,
     required this.done,
     required this.progress,
+    required this.linkInfo,
     required this.onDownload,
     required this.onCancel,
   });
@@ -969,6 +1045,7 @@ class _BottomBar extends StatelessWidget {
   final int selectedCount;
   final int done;
   final ValueListenable<TransferProgress?> progress;
+  final WifiLinkInfo linkInfo;
   final VoidCallback onDownload;
   final VoidCallback onCancel;
 
@@ -994,6 +1071,7 @@ class _BottomBar extends StatelessWidget {
                   progress: value,
                   done: done,
                   outOf: selectedCount,
+                  linkInfo: linkInfo,
                 ),
               ),
               const SizedBox(height: 12),
@@ -1029,6 +1107,7 @@ class _CurrentShot extends StatelessWidget {
     required this.progress,
     required this.done,
     required this.outOf,
+    required this.linkInfo,
   });
 
   final TransferProgress? progress;
@@ -1037,6 +1116,13 @@ class _CurrentShot extends StatelessWidget {
   final int done;
 
   final int outOf;
+
+  /// Wi-Fi radio characteristics, when Android reports them. A slow meter next
+  /// to a low link speed points at the radio, not the app; a slow meter next to
+  /// a healthy link speed points somewhere else (storage, the camera itself).
+  /// A weak RSSI alongside a low link speed points at distance/obstructions —
+  /// fixable by moving closer, not by this app.
+  final WifiLinkInfo linkInfo;
 
   @override
   Widget build(BuildContext context) {
@@ -1087,12 +1173,23 @@ class _CurrentShot extends StatelessWidget {
             ),
             if (value != null && value.bytesPerSecond > 0)
               Text(
-                '${formatBytes(value.bytesPerSecond.round())}/s',
+                linkInfo.linkSpeedMbps == null
+                    ? '${formatBytes(value.bytesPerSecond.round())}/s'
+                    : '${formatBytes(value.bytesPerSecond.round())}/s · '
+                        'link ${linkInfo.linkSpeedMbps}Mbps',
                 style: theme.textTheme.bodySmall
                     ?.copyWith(color: theme.colorScheme.primary),
               ),
           ],
         ),
+        if (linkInfo.isWeakSignal) ...[
+          const SizedBox(height: 4),
+          Text(
+            'Weak Wi-Fi signal (${linkInfo.rssiDbm} dBm) — move closer to the '
+            'camera for a faster transfer.',
+            style: theme.textTheme.bodySmall?.copyWith(color: theme.hintColor),
+          ),
+        ],
       ],
     );
   }

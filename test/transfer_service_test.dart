@@ -38,14 +38,18 @@ CameraItem get _raw => CameraItem(
     );
 
 /// Serves [chunks] separate chunks, the way a real streamed download arrives.
-http.Client _streamingClient(int chunks) => MockClient.streaming(
-      (request, bodyStream) async => http.StreamedResponse(
-        Stream.fromIterable(
-          List.generate(chunks, (_) => Uint8List(_chunkSize)),
-        ),
-        200,
-        contentLength: chunks * _chunkSize,
-      ),
+http.Client _streamingClient(int chunks, {Duration delay = Duration.zero}) =>
+    MockClient.streaming(
+      (request, bodyStream) async {
+        if (delay > Duration.zero) await Future<void>.delayed(delay);
+        return http.StreamedResponse(
+          Stream.fromIterable(
+            List.generate(chunks, (_) => Uint8List(_chunkSize)),
+          ),
+          200,
+          contentLength: chunks * _chunkSize,
+        );
+      },
     );
 
 void main() {
@@ -156,6 +160,37 @@ void main() {
 
     expect(results.single.outcome, TransferOutcome.skippedRaw);
     expect(requests, 0);
+  });
+
+  test('overlaps the gallery copy with the next download', () async {
+    const chunks = 4;
+    const size = chunks * _chunkSize;
+    const step = Duration(milliseconds: 40);
+    final galleryCalls = <String>[];
+    final service = TransferService(
+      client: _streamingClient(chunks, delay: step),
+      destination: temp,
+      saveToGallery: (file) async {
+        galleryCalls.add(p.basename(file.path));
+        await Future<void>.delayed(step);
+      },
+    );
+
+    final stopwatch = Stopwatch()..start();
+    final results = await service.transferAll([
+      _jpeg(byteSize: size, title: 'A.JPG'),
+      _jpeg(byteSize: size, title: 'B.JPG'),
+      _jpeg(byteSize: size, title: 'C.JPG'),
+    ]).toList();
+    stopwatch.stop();
+
+    expect(results.map((r) => r.item.title).toList(), ['A.JPG', 'B.JPG', 'C.JPG']);
+    expect(results.every((r) => r.outcome == TransferOutcome.saved), isTrue);
+    expect(galleryCalls, ['A.JPG', 'B.JPG', 'C.JPG']);
+    // Fully serialized (3 downloads + 3 gallery copies, each one `step`)
+    // would take ~6 steps. Overlapped, a gallery copy hides behind the next
+    // download and the batch should finish in roughly 4 steps instead.
+    expect(stopwatch.elapsed, lessThan(step * 5));
   });
 
   test('skips a file already on disk at the advertised size', () async {

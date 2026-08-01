@@ -39,8 +39,13 @@ If **Scan** finds nothing, the hint names the cause (Wi-Fi off, Location off,
 permission refused, or rate-limited). Use **Open Location settings** /
 **Open app settings** / **Open Wi-Fi settings** under the hint.
 
-Transferred files land in the app's external files directory and are also added to
-a **SonyTransfer** album in the gallery.
+By default transferred shots are added to a **SonyTransfer** album in the Photos
+app. Tap **Choose folder** (shown once connected) to redirect them anywhere
+reachable through Android's folder picker instead — an SD card, `Downloads`, a
+synced cloud folder. The choice is remembered across sessions; **Reset** goes back
+to the Photos album. If the chosen folder becomes unreachable mid-transfer (an SD
+card pulled, a permission revoked), affected shots fall back to the Photos album
+rather than failing outright.
 
 ### The timeline
 
@@ -53,10 +58,17 @@ connecting, and older ones keep filling in below while you browse. You can selec
 and start transferring straight away — there is no need to wait for the footer to
 stop saying "Loading older shots".
 
-Tap a thumbnail to select it, hold to open a larger preview you can pinch-zoom.
-**All** / **None** on a day header covers that day; the toolbar buttons cover the
-whole card. Nothing is selected to begin with, and raw shots cannot be selected at
-all — they show a `RAW` badge instead.
+Tap a thumbnail to open it full-screen; the checkbox in its corner (or a
+long-press) selects it without leaving the grid. **All** / **None** on a day
+header covers that day; the toolbar buttons cover the whole card. Nothing is
+selected to begin with, and raw shots cannot be selected at all — they show a
+`RAW` badge instead.
+
+The full-screen preview is its own page, not a popup: swipe left or right to
+step through every shot in the timeline in the same order the grid shows them,
+across day boundaries. It carries a page counter (`3 / 128`), pinch-zoom, and
+the same select control, now in the app bar, so a shot can be picked after a
+proper look without going back to the grid.
 
 Tiles load the camera's `_SM` (640×480) rendition rather than the `_TN` thumbnail,
 which is too small to judge a shot on a modern phone screen; the preview uses
@@ -101,8 +113,16 @@ leave the DIRECT- network in one tap.
   marked, then skipped. Use the SD card for those.
 - The camera's Wi-Fi is 2.4GHz single-stream, which realistically caps throughput
   around 2–3 MB/s. A 42MP JPEG is 15–25MB, so budget roughly 8 seconds per shot.
-  The bottom bar shows live MB/s and the summary reports the batch average, so you
-  can tell a slow link apart from a slow app.
+  The bottom bar shows live MB/s next to the negotiated link speed (and, once a
+  transfer is running, the signal strength if it's weak), so you can tell a slow
+  link apart from a slow app. While connected, the app holds a Wi-Fi lock (and a
+  CPU wake lock) so the phone's own power-saving policy can't throttle the radio
+  mid-transfer — this is the single biggest software-fixable gap between a phone
+  and a tablet on the same camera. What's left after that is hardware: some phones
+  simply carry a lower-throughput Wi-Fi chipset than a tablet, and no software
+  change closes that gap. Downloads are also always sequential (one shot at a
+  time) — running several in parallel doesn't help on a link this slow and only
+  adds contention.
 - The camera drops the connection shortly after it leaves sending mode, and it will
   time out on its own if left idle.
 
@@ -147,6 +167,7 @@ lib/
 ├── services/
 │   ├── sony_camera_client.dart      probe, X_TransferStart/End, newest-first Browse
 │   ├── network_binding.dart         Wi-Fi pinning via platform channel
+│   ├── destination_folder.dart      SAF folder picker, via platform channel
 │   └── transfer_service.dart        streaming download, skip logic, gallery save
 ├── widgets/timeline_view.dart       date headers, thumbnail grid, selection
 └── screens/home_screen.dart         connect → browse → select → transfer UI
