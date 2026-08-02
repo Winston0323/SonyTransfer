@@ -261,13 +261,13 @@ class MainActivity : FlutterActivity() {
             result.error("busy", "A folder picker is already open.", null)
             return
         }
-        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).addFlags(
-            Intent.FLAG_GRANT_READ_URI_PERMISSION or
-                Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
-                Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION,
-        )
+        // No grant flags on the *outgoing* intent — OPEN_DOCUMENT_TREE delivers
+        // them on the result. Putting persistable/write flags here confuses some
+        // OEMs into returning a URI we cannot actually take write access for.
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE)
         try {
             folderPickResult = result
+            @Suppress("DEPRECATION")
             startActivityForResult(intent, FOLDER_PICK_REQUEST)
         } catch (e: Exception) {
             Log.w(TAG, "folder picker unavailable", e)
@@ -277,50 +277,75 @@ class MainActivity : FlutterActivity() {
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        @Suppress("DEPRECATION")
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode != FOLDER_PICK_REQUEST) return
-        val pending = folderPickResult ?: return
+        val pending = folderPickResult
         folderPickResult = null
 
         val uri = data?.data
         if (resultCode != RESULT_OK || uri == null) {
-            pending.success(mapOf("ok" to false, "name" to currentDestinationName()))
+            pending?.success(mapOf("ok" to false, "name" to currentDestinationName()))
             return
         }
 
         try {
-            contentResolver.takePersistableUriPermission(
-                uri,
-                Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
-            )
+            // Take only the flags the system actually granted on this result.
+            // Hard-coding WRITE when the Intent did not grant it makes the
+            // persisted entry read-only (or throws) on several OEMs — after
+            // which every save quietly fell back to the Photos album.
+            var takeFlags = (data.flags and
+                (Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                    Intent.FLAG_GRANT_WRITE_URI_PERMISSION))
+            if (takeFlags == 0) {
+                takeFlags = Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                    Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+            }
+            contentResolver.takePersistableUriPermission(uri, takeFlags)
             prefs.edit().putString(PREF_DESTINATION_URI, uri.toString()).apply()
-            Log.i(TAG, "destination folder set: $uri")
-            pending.success(mapOf("ok" to true, "name" to displayNameFor(uri)))
+            Log.i(TAG, "destination folder set: $uri (flags=$takeFlags)")
+            // Persist even when the MethodChannel.Result was lost to an
+            // activity recreate while the picker was open — otherwise the
+            // user-picked folder is thrown away and never used.
+            pending?.success(mapOf("ok" to true, "name" to displayNameFor(uri)))
         } catch (e: Exception) {
             Log.w(TAG, "could not persist folder permission", e)
-            pending.success(mapOf("ok" to false, "name" to currentDestinationName()))
+            pending?.success(mapOf("ok" to false, "name" to currentDestinationName()))
         }
     }
 
-    /** The chosen folder's tree URI, or null if none is set or its grant expired. */
+    /** The chosen folder's tree URI, or null if none is set. */
     private fun destinationUri(): Uri? {
         val raw = prefs.getString(PREF_DESTINATION_URI, null) ?: return null
-        val uri = Uri.parse(raw)
-        val stillGranted = contentResolver.persistedUriPermissions.any {
-            it.uri == uri && it.isReadPermission && it.isWritePermission
+        return Uri.parse(raw)
+    }
+
+    /**
+     * Whether [uri] still has a persisted write grant. Matching is intentionally
+     * loose — Uri.equals is encoding-sensitive and has false-negatived on OEM
+     * builds, which used to wipe the saved folder and send every shot to the
+     * Photos album instead.
+     */
+    private fun hasPersistedWriteAccess(uri: Uri): Boolean {
+        return contentResolver.persistedUriPermissions.any { perm ->
+            urisMatch(perm.uri, uri) && perm.isWritePermission
         }
-        if (!stillGranted) {
-            prefs.edit().remove(PREF_DESTINATION_URI).apply()
-            return null
-        }
-        return uri
+    }
+
+    private fun urisMatch(a: Uri, b: Uri): Boolean {
+        if (a == b || a.toString() == b.toString()) return true
+        return a.scheme == b.scheme &&
+            a.authority == b.authority &&
+            a.path == b.path
     }
 
     private fun currentDestinationName(): String? =
         destinationUri()?.let { displayNameFor(it) }
 
     private fun displayNameFor(uri: Uri): String =
-        DocumentFile.fromTreeUri(this, uri)?.name ?: uri.lastPathSegment ?: "Selected folder"
+        DocumentFile.fromTreeUri(this, uri)?.name
+            ?: uri.lastPathSegment?.substringAfterLast(':')
+            ?: "Selected folder"
 
     private fun clearDestinationFolder() {
         destinationUri()?.let { uri ->
@@ -346,21 +371,45 @@ class MainActivity : FlutterActivity() {
         if (sourcePath.isNullOrEmpty() || fileName.isNullOrEmpty()) {
             return mapOf("ok" to false, "reason" to "bad_args")
         }
-        val tree = destinationUri()?.let { DocumentFile.fromTreeUri(this, it) }
+        val uri = destinationUri()
             ?: return mapOf("ok" to false, "reason" to "no_folder")
+        val tree = DocumentFile.fromTreeUri(this, uri)
+            ?: return mapOf("ok" to false, "reason" to "bad_tree")
+        if (!tree.canWrite()) {
+            // Grant gone (user revoked in system settings, SD card pulled).
+            // Clear so the UI stops claiming a folder we can no longer use.
+            if (!hasPersistedWriteAccess(uri)) {
+                prefs.edit().remove(PREF_DESTINATION_URI).apply()
+            }
+            return mapOf("ok" to false, "reason" to "not_writable")
+        }
+
+        val source = File(sourcePath)
+        if (!source.isFile) {
+            return mapOf("ok" to false, "reason" to "missing_source")
+        }
 
         return try {
+            // Providers disagree on whether createFile keeps the extension when
+            // the mime type already implies one. Prefer an exact-name replace,
+            // and fall back to a mime-less create if the first attempt fails.
             tree.findFile(fileName)?.delete()
             val target = tree.createFile(mimeTypeFor(fileName), fileName)
+                ?: tree.createFile("application/octet-stream", fileName)
                 ?: return mapOf("ok" to false, "reason" to "create_failed")
 
-            val opened = contentResolver.openOutputStream(target.uri)?.use { out ->
-                File(sourcePath).inputStream().use { input -> input.copyTo(out) }
-                true
-            } ?: false
+            contentResolver.openOutputStream(target.uri, "w")?.use { out ->
+                source.inputStream().use { input -> input.copyTo(out) }
+            } ?: run {
+                target.delete()
+                return mapOf("ok" to false, "reason" to "open_failed")
+            }
 
-            if (!opened) target.delete()
-            mapOf("ok" to opened, "reason" to if (opened) null else "open_failed")
+            mapOf("ok" to true, "reason" to null)
+        } catch (e: SecurityException) {
+            Log.w(TAG, "saveFileToDestination lost permission", e)
+            prefs.edit().remove(PREF_DESTINATION_URI).apply()
+            mapOf("ok" to false, "reason" to "permission_lost")
         } catch (e: Exception) {
             Log.w(TAG, "saveFileToDestination failed", e)
             mapOf("ok" to false, "reason" to e.javaClass.simpleName)

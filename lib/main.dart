@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 
-import 'screens/home_screen.dart';
+import 'screens/home_shell.dart';
 
 void main() {
   runApp(const SonyTransferApp());
@@ -21,7 +21,7 @@ class SonyTransferApp extends StatelessWidget {
         ),
         useMaterial3: true,
       ),
-      home: const HomeScreen(),
+      home: const HomeShell(),
     );
   }
 }

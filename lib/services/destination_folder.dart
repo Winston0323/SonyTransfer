@@ -25,9 +25,9 @@ class DestinationFolder {
 
   static Future<FolderPickResult> pick() async {
     try {
-      final raw = await _channel
-          .invokeMethod<Map<dynamic, dynamic>>('pickDestinationFolder');
-      if (raw == null) return const FolderPickResult(ok: false);
+      final raw =
+          await _channel.invokeMethod<dynamic>('pickDestinationFolder');
+      if (raw is! Map) return const FolderPickResult(ok: false);
       return FolderPickResult(
         ok: raw['ok'] == true,
         name: raw['name'] as String?,
@@ -62,22 +62,37 @@ class DestinationFolder {
   }
 
   /// Copies an already-downloaded file at [sourcePath] into the chosen
-  /// folder as [fileName]. Only meaningful once [pick] has succeeded;
-  /// callers should fall back to the Photos album otherwise.
-  static Future<bool> save({
+  /// folder as [fileName]. Only meaningful once [pick] has succeeded.
+  static Future<DestinationSaveResult> save({
     required String sourcePath,
     required String fileName,
   }) async {
     try {
-      final raw = await _channel.invokeMethod<Map<dynamic, dynamic>>(
+      // Untyped on purpose: the channel returns Map<Object?, Object?> whose
+      // cast to Map<dynamic, dynamic> has thrown on some Flutter versions,
+      // which used to make every destination save look like a failure and
+      // dump the shot into the Photos album instead.
+      final raw = await _channel.invokeMethod<dynamic>(
         'saveFileToDestination',
         {'sourcePath': sourcePath, 'fileName': fileName},
       );
-      return raw?['ok'] == true;
-    } on PlatformException {
-      return false;
+      if (raw is Map && raw['ok'] == true) {
+        return const DestinationSaveResult(ok: true);
+      }
+      final reason = raw is Map ? raw['reason']?.toString() : 'bad_reply';
+      return DestinationSaveResult(ok: false, reason: reason);
+    } on PlatformException catch (e) {
+      return DestinationSaveResult(ok: false, reason: e.code);
     } on MissingPluginException {
-      return false;
+      return const DestinationSaveResult(ok: false, reason: 'no_plugin');
     }
   }
+}
+
+/// Outcome of copying one shot into the user-chosen destination folder.
+class DestinationSaveResult {
+  const DestinationSaveResult({required this.ok, this.reason});
+
+  final bool ok;
+  final String? reason;
 }

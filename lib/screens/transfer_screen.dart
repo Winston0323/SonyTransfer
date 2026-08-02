@@ -25,14 +25,22 @@ final ButtonStyle _compactButtonStyle = TextButton.styleFrom(
   visualDensity: VisualDensity.compact,
 );
 
-class HomeScreen extends StatefulWidget {
-  const HomeScreen({super.key});
+/// The camera connect + browse + transfer flow. [HomeShell] keeps it alive
+/// beside the album rather than pushing it as a route: popping a route would
+/// dispose this state, whose teardown drops the camera's Wi-Fi — so "back"
+/// merely hides the screen and the connection survives.
+class TransferScreen extends StatefulWidget {
+  const TransferScreen({super.key, this.onBack});
+
+  /// Returns to the album. Shown as the app-bar back button — there is no
+  /// route to pop, since leaving must not dispose this screen.
+  final VoidCallback? onBack;
 
   @override
-  State<HomeScreen> createState() => _HomeScreenState();
+  State<TransferScreen> createState() => _TransferScreenState();
 }
 
-class _HomeScreenState extends State<HomeScreen> {
+class _TransferScreenState extends State<TransferScreen> {
   final TextEditingController _hostController =
       TextEditingController(text: SonyCameraClient.defaultHost);
   final TextEditingController _ssidController = TextEditingController();
@@ -161,7 +169,12 @@ class _HomeScreenState extends State<HomeScreen> {
   Future<void> _pickDestinationFolder() async {
     final result = await DestinationFolder.pick();
     if (!mounted) return;
-    setState(() => _destinationFolderName = result.name);
+    // Re-read from Android: the pick Result can be lost if the activity was
+    // recreated while the system folder UI was up, even though the URI was
+    // still persisted — currentName is the source of truth for saves.
+    final name = await DestinationFolder.currentName() ?? result.name;
+    if (!mounted) return;
+    setState(() => _destinationFolderName = name);
   }
 
   Future<void> _clearDestinationFolder() async {
@@ -562,6 +575,10 @@ class _HomeScreenState extends State<HomeScreen> {
     _progress.value = null;
     setState(() {
       _stage = _Stage.finished;
+      // The batch is dealt with, so start the next pick from a clean slate.
+      // A cancelled run keeps its selection — the natural follow-up there is
+      // resuming, not re-picking.
+      if (!cancelled) _selected.clear();
       _status = cancelled
           ? 'Cancelled after $saved saved, averaging $rate.'
           : 'Saved $saved of ${queue.length}'
@@ -621,6 +638,9 @@ class _HomeScreenState extends State<HomeScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
+        leading: widget.onBack == null
+            ? null
+            : BackButton(onPressed: widget.onBack),
         title: const Text('Sony Transfer'),
         actions: [
           if (_sections.isNotEmpty && _stage != _Stage.transferring) ...[
@@ -1256,7 +1276,9 @@ class _CurrentShot extends StatelessWidget {
 
   final TransferProgress? progress;
 
-  /// Shots finished with, whatever their outcome.
+  /// Shots finished with, whatever their outcome. Used only to place the
+  /// counter before the first progress event arrives (or right after a
+  /// skipped shot, which produces none).
   final int done;
 
   final int outOf;
@@ -1273,6 +1295,10 @@ class _CurrentShot extends StatelessWidget {
     final theme = Theme.of(context);
     final value = progress;
     final expected = value?.total ?? 0;
+    // "3 / 4" means the third shot of four is coming down right now — the
+    // shot's place in the queue, not a completed count that would read one
+    // behind for the whole download.
+    final current = value?.position ?? (done + 1).clamp(1, outOf == 0 ? 1 : outOf);
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -1288,7 +1314,7 @@ class _CurrentShot extends StatelessWidget {
             ),
             const SizedBox(width: 8),
             Text(
-              '$done / $outOf',
+              '$current / $outOf',
               style: theme.textTheme.bodySmall
                   ?.copyWith(fontWeight: FontWeight.w600),
             ),

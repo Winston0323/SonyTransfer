@@ -19,6 +19,16 @@ The A7R III offers three plausible transfer paths. Only one of them is pleasant:
 
 ## Using it
 
+The app opens on **the album**: every shot it has ever transferred, grouped by
+day newest-first, independent of the camera being anywhere nearby. Tap the
+camera icon in the app bar to get to the connect-and-transfer flow described
+below; going back refreshes the album with whatever just came in.
+
+Going back does **not** cut the camera connection: the transfer flow is kept
+alive behind the album rather than being torn down, so you can browse the
+album mid-session — or even mid-transfer — and return to find everything
+exactly as you left it, still connected.
+
 On the camera:
 
 1. `MENU → Network → Send to Smartphone Func. → Send to Smartphone`.
@@ -28,9 +38,9 @@ On the camera:
 
 On the phone:
 
-4. Open Sony Transfer. Turn **Location** on (Android hides Wi-Fi names without
-   it), tap **Scan**, and pick the camera network — or type the `DIRECT-…`
-   name from the camera screen.
+4. From the album, tap the camera icon. Turn **Location** on (Android hides
+   Wi-Fi names without it), tap **Scan**, and pick the camera network — or
+   type the `DIRECT-…` name from the camera screen.
 5. Type the password and tap **Connect**. Approve Android's temporary network
    prompt. The camera network is not saved and is released on **Disconnect**.
 6. Pick the shots you want from the timeline and tap **Transfer**.
@@ -57,8 +67,47 @@ app. Tap **Choose folder** (shown once connected) to redirect them anywhere
 reachable through Android's folder picker instead — an SD card, `Downloads`, a
 synced cloud folder. The choice is remembered across sessions; **Reset** goes back
 to the Photos album. If the chosen folder becomes unreachable mid-transfer (an SD
-card pulled, a permission revoked), affected shots fall back to the Photos album
-rather than failing outright.
+card pulled, a permission revoked), that shot fails with an error rather than
+quietly landing in the Photos album — pick the folder again, or Reset.
+
+### The album (home page)
+
+The home page is an album of shots **this app has transferred**, not of
+whatever else happens to live in the Photos app or a chosen destination
+folder — those may already hold unrelated pictures, and a destination folder
+picked through Android's document UI cannot be listed back out of without
+extra permissions the app does not ask for.
+
+Instead, every downloaded shot is left in the app's own private cache folder
+even after also being copied into the Photos album or a chosen destination
+folder (see below) — nothing else ever writes there, so it is a ready-made,
+always-available record of exactly what this app has moved off the camera.
+The album lists that folder's contents, grouped by **the day the shot was
+taken** (newest first), with the same tap-to-preview / swipe-through-everything
+behaviour as the camera timeline. Pull to refresh re-scans it, which mainly
+matters if files were removed from outside the app.
+
+The shot date survives without a database: as each file finishes downloading,
+its modification time is stamped with the capture date the camera reported.
+Shots the camera reports no date for — and files transferred before the app
+started stamping — group under the day they were downloaded instead.
+
+In the full-screen preview, the **info** button opens a sheet with the shot's
+details: file name, size on disk, pixel dimensions, shot date, focal length
+and lens (read from the JPEG's EXIF block), and the file's local path.
+
+Swiping through the preview stays quick even though every file is a full
+42-megapixel frame: each shot is decoded at roughly twice the screen's width
+rather than full size (about a tenth of the pixels), and the neighbours of
+the shot on screen are decoded ahead of time, so they are ready before the
+swipe that reveals them.
+
+Long-press a shot to start selecting (tap then extends the selection; the app
+bar offers **Select all**), and the trash icon deletes the selection after a
+confirmation. Deleting only removes shots from this album's own cache — copies
+already saved to the Photos app or a chosen destination folder are kept — and
+a deleted shot becomes transferable from the camera again, since the
+skip-already-transferred check looks at this same cache.
 
 ### The timeline
 
@@ -182,14 +231,24 @@ lib/
 ├── main.dart
 ├── models/
 │   ├── camera_item.dart             shots, their renditions and capture date
-│   └── timeline.dart                pure day-grouping and header labels
+│   ├── timeline.dart                pure day-grouping and header labels
+│   └── transferred_photo.dart       day-grouping for the local album
 ├── services/
 │   ├── sony_camera_client.dart      probe, X_TransferStart/End, newest-first Browse
 │   ├── network_binding.dart         Wi-Fi pinning via platform channel
 │   ├── destination_folder.dart      SAF folder picker, via platform channel
-│   └── transfer_service.dart        streaming download, skip logic, gallery save
-├── widgets/timeline_view.dart       date headers, thumbnail grid, selection
-└── screens/home_screen.dart         connect → browse → select → transfer UI
+│   ├── transfer_service.dart        streaming download, skip logic, gallery save
+│   └── thumbnail_cache.dart         disk-cached, concurrency-capped camera images
+├── widgets/
+│   ├── timeline_view.dart           date headers, thumbnail grid, selection
+│   ├── preview_page.dart            swipeable full-screen preview (camera shots)
+│   ├── local_preview_page.dart      swipeable full-screen preview (album shots)
+│   ├── photo_info_sheet.dart        file/EXIF details sheet for album shots
+│   └── cached_camera_image.dart     Image.network stand-in backed by the cache
+└── screens/
+    ├── home_shell.dart              keeps album + transfer flow both alive
+    ├── album_screen.dart            home page: album of already-transferred shots
+    └── transfer_screen.dart         connect → browse → select → transfer UI
 ```
 
 The Kotlin half is a single `MethodChannel` in `MainActivity.kt`.

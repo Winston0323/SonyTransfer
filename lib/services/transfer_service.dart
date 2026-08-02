@@ -7,6 +7,7 @@ import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
 import '../models/camera_item.dart';
+import '../models/transferred_photo.dart';
 import 'destination_folder.dart';
 
 enum TransferOutcome { saved, skippedExisting, skippedRaw, failed }
@@ -14,12 +15,19 @@ enum TransferOutcome { saved, skippedExisting, skippedRaw, failed }
 class TransferProgress {
   const TransferProgress({
     required this.item,
+    required this.position,
     required this.received,
     required this.total,
     required this.bytesPerSecond,
   });
 
   final CameraItem item;
+
+  /// 1-based place of [item] within the batch being transferred, so the UI
+  /// can say "shot 3 of 4 is coming down" rather than "2 are finished" —
+  /// the latter reads one behind while a download is in flight.
+  final int position;
+
   final int received;
   final int total;
   final double bytesPerSecond;
@@ -89,6 +97,46 @@ class TransferService {
     return dir;
   }
 
+  /// Shots already sitting in the local download cache from a previous
+  /// transfer, most recently taken first (each file's modification time is
+  /// stamped with the camera's capture date as it is downloaded).
+  ///
+  /// [destinationDirectory] is private to the app — nothing else ever writes
+  /// to it, and a completed download is left there even after also being
+  /// copied into the Photos album or a chosen destination folder (see
+  /// [_addToGallery]) — so everything found here was necessarily transferred
+  /// by this app, unlike either of those, which may already hold pictures
+  /// that have nothing to do with it.
+  Future<List<TransferredPhoto>> listTransferred() async {
+    final dir = await destinationDirectory();
+    if (!await dir.exists()) return const [];
+
+    final photos = <TransferredPhoto>[];
+    await for (final entry in dir.list()) {
+      if (entry is! File) continue;
+      if (p.extension(entry.path).toLowerCase() == '.part') continue;
+      photos.add(
+        TransferredPhoto(
+          file: entry,
+          takenAt: await entry.lastModified(),
+        ),
+      );
+    }
+    photos.sort((a, b) => b.takenAt.compareTo(a.takenAt));
+    return photos;
+  }
+
+  /// Removes shots from the local download cache — the album's backing
+  /// store. Copies already made into the Photos album or a chosen
+  /// destination folder are untouched; this only makes the album forget
+  /// them. A deleted shot will also be transferable again, since the
+  /// skip-existing check looks at this same folder.
+  Future<void> deleteTransferred(Iterable<TransferredPhoto> photos) async {
+    for (final photo in photos) {
+      if (await photo.file.exists()) await photo.file.delete();
+    }
+  }
+
   /// Transfers [items] one download at a time, reporting each result as it
   /// lands.
   ///
@@ -134,7 +182,9 @@ class TransferService {
         ..reset()
         ..start();
 
-      for (final item in items) {
+      for (var i = 0; i < items.length; i++) {
+        final item = items[i];
+        final position = i + 1;
         if (_cancelled) break;
 
         if (item.isRawOnly) {
@@ -163,7 +213,7 @@ class TransferService {
         }
 
         try {
-          await _download(item, resource, file, onProgress);
+          await _download(item, position, resource, file, onProgress);
         } catch (e) {
           if (await file.exists()) await file.delete();
           enqueue(
@@ -196,6 +246,7 @@ class TransferService {
 
   void _emitProgress(
     CameraItem item,
+    int position,
     int received,
     int total,
     void Function(TransferProgress progress)? onProgress, {
@@ -215,6 +266,7 @@ class TransferService {
     onProgress(
       TransferProgress(
         item: item,
+        position: position,
         received: received,
         total: total,
         bytesPerSecond: averageBytesPerSecond,
@@ -224,6 +276,7 @@ class TransferService {
 
   Future<void> _download(
     CameraItem item,
+    int position,
     CameraResource resource,
     File file,
     void Function(TransferProgress progress)? onProgress,
@@ -240,7 +293,7 @@ class TransferService {
     // Announce the new shot at zero bytes rather than waiting for its first
     // chunk, which on this link can be most of a second away — long enough for a
     // per-shot progress bar to sit at the previous shot's 100%.
-    _emitProgress(item, 0, total, onProgress, force: true);
+    _emitProgress(item, position, 0, total, onProgress, force: true);
 
     // Download to a temporary name so an interrupted transfer never leaves a
     // half-written file that the skip-existing check might later trust.
@@ -254,7 +307,7 @@ class TransferService {
         sink.add(chunk);
         received += chunk.length;
         _sessionBytes += chunk.length;
-        _emitProgress(item, received, total, onProgress);
+        _emitProgress(item, position, received, total, onProgress);
       }
       await sink.flush();
     } finally {
@@ -267,6 +320,13 @@ class TransferService {
     }
 
     await partial.rename(file.path);
+
+    // Stamp the file with the camera's capture time, so the shot date
+    // survives without a separate database — the local album groups its
+    // timeline by this. Shots the camera reported no date for keep the
+    // download time, the closest thing available.
+    final captured = item.captured;
+    if (captured != null) await file.setLastModified(captured);
   }
 
   Future<void> _addToGallery(File file) async {
@@ -279,10 +339,15 @@ class TransferService {
         sourcePath: file.path,
         fileName: p.basename(file.path),
       );
-      if (saved) return;
-      // The chosen folder may have gone away mid-batch (SD card pulled, a
-      // synced cloud folder revoked). Landing the shot in Photos instead of
-      // losing it beats failing the whole transfer over one bad folder.
+      if (saved.ok) return;
+      // Do not fall back to the Photos album when the user explicitly chose
+      // a folder — that is exactly how shots used to "disappear" into
+      // SonyTransfer while the UI still claimed they were going elsewhere.
+      throw Exception(
+        'Could not save to $folderName'
+        '${saved.reason == null ? '' : ' (${saved.reason})'}. '
+        'Pick the folder again, or Reset to use the Photos album.',
+      );
     }
 
     if (!await Gal.hasAccess()) {

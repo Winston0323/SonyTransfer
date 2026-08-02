@@ -10,11 +10,16 @@ import 'package:sony_transfer/services/transfer_service.dart';
 
 const int _chunkSize = 1024;
 
-CameraItem _jpeg({required int byteSize, String title = 'DSC00001.JPG'}) =>
+CameraItem _jpeg({
+  required int byteSize,
+  String title = 'DSC00001.JPG',
+  DateTime? captured,
+}) =>
     CameraItem(
       id: title,
       title: title,
       folder: '100MSDCF',
+      captured: captured,
       resources: [
         CameraResource(
           url: 'http://192.168.122.1:60152/orig.jpg',
@@ -126,6 +131,51 @@ void main() {
     }
   });
 
+  test('reports each shot at its 1-based place in the batch', () async {
+    const chunks = 4;
+    const size = chunks * _chunkSize;
+    final service = serviceWith(_streamingClient(chunks));
+    final updates = <TransferProgress>[];
+
+    await service.transferAll(
+      [
+        _jpeg(byteSize: size, title: 'A.JPG'),
+        _raw, // Skipped, but still the second shot of the batch.
+        _jpeg(byteSize: size, title: 'C.JPG'),
+      ],
+      onProgress: updates.add,
+    ).toList();
+
+    // Positions count through the whole batch, skips included, so the UI's
+    // "3 / 3" matches what the user selected rather than what downloaded.
+    expect(
+      updates.map((u) => u.item.title).toSet(),
+      {'A.JPG', 'C.JPG'},
+    );
+    for (final update in updates) {
+      expect(update.position, update.item.title == 'A.JPG' ? 1 : 3);
+    }
+  });
+
+  test('stamps the downloaded file with the camera capture time', () async {
+    const chunks = 4;
+    final captured = DateTime(2026, 7, 4, 15, 30);
+    final service = serviceWith(_streamingClient(chunks));
+
+    await service.transferAll(
+      [_jpeg(byteSize: chunks * _chunkSize, captured: captured)],
+    ).toList();
+
+    final written = File(p.join(temp.path, 'DSC00001.JPG'));
+    // The local album groups its timeline by file modification time, so the
+    // stamp is what makes it a shot-date timeline rather than a transfer log.
+    expect(written.lastModifiedSync(), captured);
+
+    // And listTransferred reads that stamp back as the shot's date.
+    final photos = await service.listTransferred();
+    expect(photos.single.takenAt, captured);
+  });
+
   test('writes the file and measures throughput', () async {
     const chunks = 64;
     final service = serviceWith(_streamingClient(chunks));
@@ -229,6 +279,52 @@ void main() {
       expect(lag, lessThan(downloadDelay.inMilliseconds ~/ 2));
     },
   );
+
+  test(
+    'listTransferred lists only whole files already in the local cache, '
+    'newest first',
+    () async {
+      final older = DateTime.now().subtract(const Duration(hours: 1));
+      final newer = DateTime.now();
+
+      File(p.join(temp.path, 'A.JPG'))
+        ..writeAsBytesSync(Uint8List(4))
+        ..setLastModifiedSync(older);
+      File(p.join(temp.path, 'B.JPG'))
+        ..writeAsBytesSync(Uint8List(4))
+        ..setLastModifiedSync(newer);
+      // A download interrupted mid-transfer — should never show up.
+      File(p.join(temp.path, 'C.JPG.part')).writeAsBytesSync(Uint8List(4));
+
+      final service = serviceWith(_streamingClient(0));
+      final photos = await service.listTransferred();
+
+      expect(photos.map((p) => p.fileName).toList(), ['B.JPG', 'A.JPG']);
+    },
+  );
+
+  test('listTransferred returns nothing before any transfer has happened',
+      () async {
+    final service = serviceWith(_streamingClient(0));
+    expect(await service.listTransferred(), isEmpty);
+  });
+
+  test('deleteTransferred removes only the given shots from the cache',
+      () async {
+    File(p.join(temp.path, 'A.JPG')).writeAsBytesSync(Uint8List(4));
+    File(p.join(temp.path, 'B.JPG')).writeAsBytesSync(Uint8List(4));
+
+    final service = serviceWith(_streamingClient(0));
+    final photos = await service.listTransferred();
+    await service.deleteTransferred(
+      photos.where((photo) => photo.fileName == 'A.JPG'),
+    );
+
+    expect(
+      (await service.listTransferred()).map((photo) => photo.fileName),
+      ['B.JPG'],
+    );
+  });
 
   test('skips a file already on disk at the advertised size', () async {
     const chunks = 4;
