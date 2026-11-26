@@ -20,24 +20,88 @@ The A7R III offers three plausible transfer paths. Only one of them is pleasant:
 ## Using it
 
 The app opens on **the album**: every shot it has ever transferred, grouped by
-day newest-first, independent of the camera being anywhere nearby. Tap the
-camera icon in the app bar to get to the connect-and-transfer flow described
-below; going back refreshes the album with whatever just came in.
+day newest-first, independent of the camera being anywhere nearby. Three ways
+to get shots off the camera:
 
-Going back does **not** cut the camera connection: the transfer flow is kept
-alive behind the album rather than being torn down, so you can browse the
-album mid-session — or even mid-transfer — and return to find everything
-exactly as you left it, still connected.
+- **Live monitor** — Ctrl w/ Smartphone. The phone shows a live view and copies
+  each new JPEG while you keep shooting on the body. This is the mode that
+  does not take the camera out of shooting.
+- **USB cable** — plug in the camera; the app opens the cable-transfer screen
+  and lets you pick which SD card to read (defaults to the JPEG card).
+- **Wi-Fi** — tap the camera icon and join the camera's `DIRECT-…` network as
+  described further below. That path is Send to Smartphone: the camera leaves
+  shooting until the send ends, which is why it is separate from the monitor.
+
+### Live monitor
+
+Use this when you want to watch the frame and have each new photo land on the
+phone without stopping to send.
+
+1. On the camera: `MENU → Network → Ctrl w/ Smartphone → On`, then open
+   **Connection** and leave that screen up. It shows a `DIRECT-` name and a
+   password. Turn **Send to Smartphone** off; that mode cannot show a live
+   view and it pauses shooting.
+2. In the app, tap the monitor icon. Scan, or type the name and password from
+   the camera, then **Start monitor**. The camera name looks like
+   `DIRECT-xxxx:ILCE-7RM3` — keep the colon. If the phone says it could not
+   establish a connection, join that same network in system Wi-Fi settings
+   while the camera Connection screen stays up, then tap **Use this Wi-Fi**.
+3. Shoot on the camera. The phone stays on the live view, and each new JPEG is
+   copied into the album in the background. You can leave the monitor for the
+   album — or turn the screen off — and the copy keeps going. **Disconnect**
+   is what ends it.
+
+The copy prefers the original JPEG when the camera offers it. Many bodies only
+offer a 2M preview over this link; RAW always stays on the card. A burst that
+is faster than the camera's Wi-Fi can still be shot — the shutter is not held
+for the copy — but a frame the phone did not finish receiving is still on the
+card and can be pulled later with Send to Smartphone or the USB cable.
+
+Going back does **not** cut an active monitor or Wi-Fi session: that flow is kept alive
+behind the album rather than being torn down, so you can browse the album
+mid-session — or even mid-transfer — and return to find everything exactly as
+you left it, still connected. Unplugging the USB cable does close the cable
+session.
+
+### USB cable transfer (dual SD cards)
+
+This is the path that can see **both** memory cards. Sony's MTP mode only
+exposes Slot 1; Mass Storage with Multi LUN is what makes Slot 2 (often the
+JPEG card when shooting `Sort(RAW/JPEG)`) reachable.
 
 On the camera:
+
+1. `MENU → Network → Ctrl w/ Smartphone → Off` (otherwise USB stays locked to
+   the smartphone control mode).
+2. `MENU → Setup → USB Connection → Mass Storage`.
+3. `MENU → Setup → USB LUN Setting → Multi`.
+4. Plug the camera into the phone with a data-capable USB cable (OTG / USB
+   host on the phone). Approve the USB access prompt.
+
+The app opens the **USB transfer** screen as soon as the camera appears. Each
+card shows up as a chip (`Card 1 · JPEG`, `Card 2 · RAW`, …); the one with the
+most JPEGs is selected by default. Switch chips to read the other card, pick
+shots, and Transfer — same destination-folder rules as Wi-Fi.
+
+If the app says the camera was found but shows **no photo cards**:
+
+- Wait ~10s after plugging in, allow USB + Photos permission, then tap
+  **Retry** (vivo and similar OEMs mount exFAT slowly).
+- Prefer camera **USB Connection → Mass Storage** and **LUN → Multi** for both
+  cards. Many phones still force **MTP**; the app falls back to MTP and can
+  read Slot 1, but Slot 2 usually stays unavailable until Mass Storage works.
+- A charge-only cable also produces this symptom.
+
+### Wi-Fi transfer (Send to Smartphone)
+
+Wi-Fi exposes only the card currently selected for playback on the camera
+(`Playback → Select PB Media`). It cannot switch slots from the phone — use
+USB when you need the other card.
 
 1. `MENU → Network → Send to Smartphone Func. → Send to Smartphone`.
 2. Pick **Select on Smartphone** to expose the whole card, or select individual
    shots on the camera first.
 3. The camera displays an SSID beginning with `DIRECT-` and a password.
-
-On the phone:
-
 4. From the album, tap the camera icon. Turn **Location** on (Android hides
    Wi-Fi names without it), tap **Scan**, and pick the camera network — or
    type the `DIRECT-…` name from the camera screen.
@@ -193,6 +257,10 @@ leave the DIRECT- network in one tap.
   adds contention.
 - The camera drops the connection shortly after it leaves sending mode, and it will
   time out on its own if left idle.
+- **Live monitor is Ctrl w/ Smartphone, not a second copy of Send to Smartphone.**
+  The A7R III has no automatic full-size FTP-while-shooting transfer. The monitor
+  copies the JPEG the remote-shooting API hands back (original when the body
+  allows it, otherwise 2M) and does not pull RAW.
 
 ## How it works
 
@@ -232,26 +300,48 @@ lib/
 ├── models/
 │   ├── camera_item.dart             shots, their renditions and capture date
 │   ├── timeline.dart                pure day-grouping and header labels
-│   └── transferred_photo.dart       day-grouping for the local album
+│   ├── transferred_photo.dart       a shot already in the local cache
+│   └── usb_card.dart                mass-storage volume / SD-card summary
 ├── services/
 │   ├── sony_camera_client.dart      probe, X_TransferStart/End, newest-first Browse
+│   ├── scalar_camera.dart           Ctrl w/ Smartphone live view and shutter wait
+│   ├── live_view_parser.dart        JPEG frames out of the live-view stream
+│   ├── monitor_session.dart         live view plus background JPEG copy
+│   ├── shot_ingest.dart             save a shutter JPEG into the album cache
 │   ├── network_binding.dart         Wi-Fi pinning via platform channel
 │   ├── destination_folder.dart      SAF folder picker, via platform channel
-│   ├── transfer_service.dart        streaming download, skip logic, gallery save
+│   ├── transfer_service.dart        streaming download (HTTP + USB), gallery save
+│   ├── usb_camera.dart              cable Mass Storage API via platform channel
 │   └── thumbnail_cache.dart         disk-cached, concurrency-capped camera images
 ├── widgets/
 │   ├── timeline_view.dart           date headers, thumbnail grid, selection
 │   ├── preview_page.dart            swipeable full-screen preview (camera shots)
-│   ├── local_preview_page.dart      swipeable full-screen preview (album shots)
-│   ├── photo_info_sheet.dart        file/EXIF details sheet for album shots
 │   └── cached_camera_image.dart     Image.network stand-in backed by the cache
 └── screens/
-    ├── home_shell.dart              keeps album + transfer flow both alive
-    ├── album_screen.dart            home page: album of already-transferred shots
-    └── transfer_screen.dart         connect → browse → select → transfer UI
+    ├── home_shell.dart              album + Wi-Fi + USB panes kept alive
+    ├── album_screen.dart            home page: cache path + camera actions
+    ├── transfer_screen.dart         Wi-Fi connect → browse → select → transfer
+    ├── usb_transfer_screen.dart     USB card pick → browse JPEGs → transfer
+    └── monitor_screen.dart          live view and background copy
 ```
 
-The Kotlin half is a single `MethodChannel` in `MainActivity.kt`.
+The day-grouped album grid, preview, and EXIF sheet live in
+[`image_album`](https://github.com/Winston0323/image_album), checked out at
+`../image-album` next to this repo. It takes a folder path and shows the
+images in that folder. `AlbumScreen` points it at the transfer cache.
+
+```
+../image-album/lib/
+├── image_album.dart                 public exports
+└── src/
+    ├── image_album.dart             three-column day grid
+    ├── album_photo.dart             scan a directory and group by day
+    ├── album_preview_page.dart      swipeable full-screen preview
+    └── photo_info_sheet.dart        file/EXIF details
+```
+
+The Kotlin half lives in `MainActivity.kt` (Wi-Fi / SAF) and `UsbMassStorage.kt`
+(libaums Mass Storage + Multi LUN).
 
 ## Development
 
@@ -261,6 +351,11 @@ flutter test        # protocol parsing is covered against recorded camera payloa
 flutter analyze
 flutter run
 ```
+
+The library checkout is `../image-album`
+([image_album](https://github.com/Winston0323/image_album)). Push library
+changes from that directory. This app depends on it by path, so a fresh clone
+also needs that checkout next to this repo. The demo app is `../image-album/example`.
 
 The first Android build downloads the Gradle 8.14 distribution (~230MB), which this
 machine did not have cached. Let it finish rather than interrupting it — a killed

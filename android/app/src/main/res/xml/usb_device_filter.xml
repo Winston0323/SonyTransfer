@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Sony USB VID 0x054C. No product-id so Mass Storage / MTP PIDs all match;
+     runtime code then checks for a mass-storage interface. -->
+<resources>
+    <usb-device vendor-id="1356" />
+</resources>

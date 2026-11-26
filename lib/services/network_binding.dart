@@ -24,6 +24,7 @@ class CameraWifiScan {
   const CameraWifiScan({
     this.cameras = const [],
     this.all = const [],
+    this.bssids = const {},
     this.problem,
   });
 
@@ -33,6 +34,10 @@ class CameraWifiScan {
   /// Everything in range, so the user can still pick a camera whose name we
   /// did not recognise.
   final List<String> all;
+
+  /// BSSID of each camera network from the last scan, when Android reported one.
+  /// Joining by BSSID avoids the colon in `DIRECT-xxxx:ILCE-7RM3`.
+  final Map<String, String> bssids;
 
   final WifiScanProblem? problem;
 }
@@ -102,9 +107,19 @@ class NetworkBinding {
       final raw =
           await _channel.invokeMethod<Map<dynamic, dynamic>>('scanCameraWifi');
       if (raw == null) return const CameraWifiScan();
+      final rawBssids = raw['cameraBssids'];
+      final bssids = <String, String>{};
+      if (rawBssids is Map) {
+        rawBssids.forEach((key, value) {
+          if (key is String && value is String && value.isNotEmpty) {
+            bssids[key] = value;
+          }
+        });
+      }
       return CameraWifiScan(
         cameras: (raw['cameras'] as List<dynamic>? ?? const []).cast<String>(),
         all: (raw['all'] as List<dynamic>? ?? const []).cast<String>(),
+        bssids: bssids,
         problem: _problemFrom(raw['problem'] as String?),
       );
     } on MissingPluginException {
@@ -127,11 +142,16 @@ class NetworkBinding {
   static Future<WifiJoinResult> joinCameraWifi({
     String ssid = '',
     required String password,
+    String? bssid,
   }) async {
     try {
       final raw = await _channel.invokeMethod<Map<dynamic, dynamic>>(
         'joinCameraWifi',
-        {'ssid': ssid, 'password': password},
+        {
+          'ssid': ssid,
+          'password': password,
+          if (bssid != null && bssid.isNotEmpty) 'bssid': bssid,
+        },
       );
       if (raw == null) {
         return const WifiJoinResult(
@@ -244,6 +264,56 @@ class NetworkBinding {
       // Nothing to release.
     } on MissingPluginException {
       // Nothing to release.
+    }
+  }
+
+  /// Drops the process-wide Wi-Fi pin and the transfer wake locks without
+  /// leaving a network this app did not itself join.
+  static Future<void> releaseBind() async {
+    try {
+      await _channel.invokeMethod<bool>('releaseBind');
+    } on PlatformException {
+      // Nothing to release.
+    } on MissingPluginException {
+      // Nothing to release.
+    }
+  }
+
+  static Future<void> setKeepScreenOn(bool on) async {
+    try {
+      await _channel.invokeMethod<bool>('setKeepScreenOn', {'on': on});
+    } on PlatformException {
+      // The monitor still works if the screen is allowed to sleep.
+    } on MissingPluginException {
+      // The monitor still works if the screen is allowed to sleep.
+    }
+  }
+
+  static Future<void> setMulticastLock(bool on) async {
+    try {
+      await _channel.invokeMethod<bool>('setMulticastLock', {'on': on});
+    } on PlatformException {
+      // SSDP is only a fallback when the well-known ports do not answer.
+    } on MissingPluginException {
+      // SSDP is only a fallback when the well-known ports do not answer.
+    }
+  }
+
+  /// Foreground notification so a photo copy keeps running when the monitor
+  /// is not the visible page, or the screen is off.
+  static Future<void> setMonitorSession({
+    required bool active,
+    String? text,
+  }) async {
+    try {
+      await _channel.invokeMethod<bool>('monitorSession', {
+        'active': active,
+        'text': text,
+      });
+    } on PlatformException {
+      // The session still runs while this process is in the foreground.
+    } on MissingPluginException {
+      // The session still runs while this process is in the foreground.
     }
   }
 

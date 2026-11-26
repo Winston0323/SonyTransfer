@@ -48,4 +48,9 @@ dependencies {
     // folder, so it can be written to with ordinary streams instead of
     // hand-rolled ContentResolver/DocumentsContract calls.
     implementation("androidx.documentfile:documentfile:1.0.1")
+    // Reads the camera as a USB mass-storage device (Multi LUN → one volume
+    // per SD card). MTP cannot reach Slot 2 on the A7R III.
+    implementation("me.jahnen.libaums:core:0.10.0")
+    // Embedded JPEG thumbnails for the USB grid (avoids decoding 42MP frames).
+    implementation("androidx.exifinterface:exifinterface:1.3.7")
 }

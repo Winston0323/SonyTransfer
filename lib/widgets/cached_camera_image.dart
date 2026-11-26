@@ -17,6 +17,7 @@ class CachedCameraImage extends StatefulWidget {
     required this.fit,
     this.loadingBuilder,
     this.errorBuilder,
+    this.fullQuality = false,
   });
 
   final String url;
@@ -24,18 +25,28 @@ class CachedCameraImage extends StatefulWidget {
   final WidgetBuilder? loadingBuilder;
   final WidgetBuilder? errorBuilder;
 
+  /// When true, USB `usb:` URLs fetch the full JPEG instead of the tiny
+  /// device thumbnail — used by the full-screen preview.
+  final bool fullQuality;
+
   @override
   State<CachedCameraImage> createState() => _CachedCameraImageState();
 }
 
 class _CachedCameraImageState extends State<CachedCameraImage> {
-  late Future<File> _future = ThumbnailCache.instance.fileFor(widget.url);
+  late Future<File> _future = _load();
+
+  Future<File> _load() => ThumbnailCache.instance.fileFor(
+        widget.url,
+        fullQuality: widget.fullQuality,
+      );
 
   @override
   void didUpdateWidget(covariant CachedCameraImage oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.url != widget.url) {
-      _future = ThumbnailCache.instance.fileFor(widget.url);
+    if (oldWidget.url != widget.url ||
+        oldWidget.fullQuality != widget.fullQuality) {
+      _future = _load();
     }
   }
 

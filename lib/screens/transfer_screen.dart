@@ -1,6 +1,5 @@
 import 'dart:async';
 
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -12,6 +11,7 @@ import '../services/saved_wifi_credentials.dart';
 import '../services/sony_camera_client.dart';
 import '../services/transfer_service.dart';
 import '../widgets/timeline_view.dart';
+import '../widgets/transfer_bottom_bar.dart';
 
 enum _Stage { idle, connecting, connected, transferring, finished }
 
@@ -45,6 +45,7 @@ class _TransferScreenState extends State<TransferScreen> {
       TextEditingController(text: SonyCameraClient.defaultHost);
   final TextEditingController _ssidController = TextEditingController();
   final TextEditingController _passwordController = TextEditingController();
+  final ScrollController _scrollController = ScrollController();
   final TransferService _transfer = TransferService();
 
   SonyCameraClient? _client;
@@ -108,6 +109,7 @@ class _TransferScreenState extends State<TransferScreen> {
   final ValueNotifier<TransferProgress?> _progress = ValueNotifier(null);
 
   int _done = 0;
+  int _queueLength = 0;
 
   /// Folder the user redirected saves to via [DestinationFolder.pick], or
   /// null when saving to the default Photos album.
@@ -284,6 +286,7 @@ class _TransferScreenState extends State<TransferScreen> {
     _hostController.dispose();
     _ssidController.dispose();
     _passwordController.dispose();
+    _scrollController.dispose();
     _progress.dispose();
     _client?.close();
     _transfer.close();
@@ -531,6 +534,7 @@ class _TransferScreenState extends State<TransferScreen> {
     setState(() {
       _stage = _Stage.transferring;
       _done = 0;
+      _queueLength = queue.length;
       _error = null;
       _status = 'Transferring…';
     });
@@ -670,6 +674,11 @@ class _TransferScreenState extends State<TransferScreen> {
         children: [
           Expanded(
             child: CustomScrollView(
+              // Own controller: HomeShell keeps album/Wi-Fi/USB in an
+              // IndexedStack, and sharing PrimaryScrollController across those
+              // offstage scroll views stops the visible timeline from moving.
+              controller: _scrollController,
+              primary: false,
               slivers: [
                 SliverToBoxAdapter(
                   child: _StatusPanel(
@@ -739,9 +748,11 @@ class _TransferScreenState extends State<TransferScreen> {
               ],
             ),
           ),
-          _BottomBar(
-            stage: _stage,
+          TransferBottomBar(
+            visible: _stage != _Stage.idle && _stage != _Stage.connecting,
+            transferring: _stage == _Stage.transferring,
             selectedCount: _selected.length,
+            queueLength: _queueLength,
             done: _done,
             progress: _progress,
             linkInfo: _linkInfo,
@@ -1194,179 +1205,3 @@ class _Instructions extends StatelessWidget {
   }
 }
 
-class _BottomBar extends StatelessWidget {
-  const _BottomBar({
-    required this.stage,
-    required this.selectedCount,
-    required this.done,
-    required this.progress,
-    required this.linkInfo,
-    required this.onDownload,
-    required this.onCancel,
-  });
-
-  final _Stage stage;
-  final int selectedCount;
-  final int done;
-  final ValueListenable<TransferProgress?> progress;
-  final WifiLinkInfo linkInfo;
-  final VoidCallback onDownload;
-  final VoidCallback onCancel;
-
-  @override
-  Widget build(BuildContext context) {
-    if (stage == _Stage.idle || stage == _Stage.connecting) {
-      return const SizedBox.shrink();
-    }
-
-    final transferring = stage == _Stage.transferring;
-
-    return SafeArea(
-      top: false,
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            if (transferring) ...[
-              ValueListenableBuilder<TransferProgress?>(
-                valueListenable: progress,
-                builder: (context, value, _) => _CurrentShot(
-                  progress: value,
-                  done: done,
-                  outOf: selectedCount,
-                  linkInfo: linkInfo,
-                ),
-              ),
-              const SizedBox(height: 12),
-            ],
-            SizedBox(
-              width: double.infinity,
-              child: transferring
-                  ? OutlinedButton.icon(
-                      onPressed: onCancel,
-                      icon: const Icon(Icons.stop),
-                      label: const Text('Cancel'),
-                    )
-                  : FilledButton.icon(
-                      onPressed: selectedCount == 0 ? null : onDownload,
-                      icon: const Icon(Icons.download),
-                      label: Text(
-                        selectedCount == 0
-                            ? 'Select shots to transfer'
-                            : 'Transfer $selectedCount selected',
-                      ),
-                    ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-/// The shot currently in flight, plus how far through the batch we are.
-class _CurrentShot extends StatelessWidget {
-  const _CurrentShot({
-    required this.progress,
-    required this.done,
-    required this.outOf,
-    required this.linkInfo,
-  });
-
-  final TransferProgress? progress;
-
-  /// Shots finished with, whatever their outcome. Used only to place the
-  /// counter before the first progress event arrives (or right after a
-  /// skipped shot, which produces none).
-  final int done;
-
-  final int outOf;
-
-  /// Wi-Fi radio characteristics, when Android reports them. A slow meter next
-  /// to a low link speed points at the radio, not the app; a slow meter next to
-  /// a healthy link speed points somewhere else (storage, the camera itself).
-  /// A weak RSSI alongside a low link speed points at distance/obstructions —
-  /// fixable by moving closer, not by this app.
-  final WifiLinkInfo linkInfo;
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final value = progress;
-    final expected = value?.total ?? 0;
-    // "3 / 4" means the third shot of four is coming down right now — the
-    // shot's place in the queue, not a completed count that would read one
-    // behind for the whole download.
-    final current = value?.position ?? (done + 1).clamp(1, outOf == 0 ? 1 : outOf);
-
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        Row(
-          children: [
-            Expanded(
-              child: Text(
-                value?.item.fileName ?? 'Starting…',
-                style: theme.textTheme.bodySmall,
-                overflow: TextOverflow.ellipsis,
-              ),
-            ),
-            const SizedBox(width: 8),
-            Text(
-              '$current / $outOf',
-              style: theme.textTheme.bodySmall
-                  ?.copyWith(fontWeight: FontWeight.w600),
-            ),
-          ],
-        ),
-        const SizedBox(height: 6),
-        // Tracks the shot in flight rather than the batch: a 20MB frame takes
-        // long enough on this link that a batch-level bar looks stuck.
-        LinearProgressIndicator(
-          value: expected <= 0
-              ? null
-              : (value!.received / expected).clamp(0.0, 1.0),
-        ),
-        const SizedBox(height: 6),
-        Row(
-          children: [
-            Expanded(
-              child: Text(
-                expected <= 0
-                    ? ''
-                    : '${formatBytes(value!.received)} of '
-                        '${formatBytes(expected)}',
-                style: theme.textTheme.bodySmall
-                    ?.copyWith(color: theme.hintColor),
-              ),
-            ),
-            if (value != null && value.bytesPerSecond > 0)
-              Text(
-                linkInfo.linkSpeedMbps == null
-                    ? '${formatBytes(value.bytesPerSecond.round())}/s'
-                    : '${formatBytes(value.bytesPerSecond.round())}/s · '
-                        'link ${linkInfo.linkSpeedMbps}Mbps',
-                style: theme.textTheme.bodySmall
-                    ?.copyWith(color: theme.colorScheme.primary),
-              ),
-          ],
-        ),
-        if (linkInfo.isWeakSignal) ...[
-          const SizedBox(height: 4),
-          Text(
-            'Weak Wi-Fi signal (${linkInfo.rssiDbm} dBm) — move closer to the '
-            'camera for a faster transfer.',
-            style: theme.textTheme.bodySmall?.copyWith(color: theme.hintColor),
-          ),
-        ],
-      ],
-    );
-  }
-}
-
-String formatBytes(int bytes) {
-  if (bytes < 1024) return '$bytes B';
-  if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(0)} KB';
-  return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
-}

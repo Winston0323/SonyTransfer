@@ -104,6 +104,9 @@ class _PreviewPageState extends State<PreviewPage> {
                   : CachedCameraImage(
                       url: url,
                       fit: BoxFit.contain,
+                      // USB grid tiles use device thumbs; preview needs the
+                      // full JPEG so swipe-browse matches Wi-Fi quality.
+                      fullQuality: url.startsWith('usb:'),
                       errorBuilder: (_) => const Icon(
                         Icons.broken_image_outlined,
                         color: Colors.white54,

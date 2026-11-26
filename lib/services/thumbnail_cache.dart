@@ -5,6 +5,8 @@ import 'dart:io';
 import 'package:http/http.dart' as http;
 import 'package:path/path.dart' as p;
 
+import 'usb_camera.dart';
+
 /// Caches camera-served thumbnails and previews on disk, and caps how many
 /// are fetched from the camera at once.
 ///
@@ -46,18 +48,51 @@ class ThumbnailCache {
 
   /// A local file holding [url]'s bytes, downloading and caching it first if
   /// this is the first time it has been asked for.
-  Future<File> fileFor(String url) =>
-      _pending.putIfAbsent(url, () => _load(url));
+  ///
+  /// [fullQuality] only affects `usb:` URLs: the grid uses device thumbnails,
+  /// while the full-screen preview copies the real JPEG.
+  Future<File> fileFor(String url, {bool fullQuality = false}) {
+    final key = fullQuality ? 'full:$url' : url;
+    return _pending.putIfAbsent(key, () => _load(url, fullQuality: fullQuality));
+  }
 
-  Future<File> _load(String url) async {
+  Future<File> _load(String url, {bool fullQuality = false}) async {
+    final pendingKey = fullQuality ? 'full:$url' : url;
     var acquired = false;
     try {
       final dir = await _dir();
-      final file = File(p.join(dir.path, _fileNameFor(url)));
+      final file = File(
+        p.join(dir.path, _fileNameFor(url, fullQuality: fullQuality)),
+      );
       if (await file.exists() && await file.length() > 0) return file;
 
       await _acquireSlot();
       acquired = true;
+
+      if (url.startsWith('usb:')) {
+        final parsed = UsbCamera.parseUrl(url);
+        if (parsed == null) throw StateError('bad usb url');
+        if (fullQuality) {
+          await UsbCamera.copyJpeg(
+            cardId: parsed.$1,
+            usbPath: parsed.$2,
+            destPath: file.path,
+          );
+          if (!await file.exists() || await file.length() <= 0) {
+            throw StateError('usb copy failed for $url');
+          }
+          return file;
+        }
+        final bytes = await UsbCamera.loadThumb(
+          cardId: parsed.$1,
+          usbPath: parsed.$2,
+        );
+        if (bytes == null || bytes.isEmpty) {
+          throw StateError('no thumb for $url');
+        }
+        await file.writeAsBytes(bytes, flush: true);
+        return file;
+      }
 
       final response = await _client
           .get(Uri.parse(url))
@@ -70,7 +105,7 @@ class ThumbnailCache {
     } catch (_) {
       // Do not remember a failure as a permanent result; the next request
       // for this URL should get a fresh try rather than repeating the error.
-      _pending.remove(url);
+      _pending.remove(pendingKey);
       rethrow;
     } finally {
       if (acquired) _releaseSlot();
@@ -94,7 +129,7 @@ class ThumbnailCache {
 
   /// Deterministic, filesystem-safe cache key for [url] (Jenkins one-at-a-time
   /// hash — no need to pull in a crypto package for this).
-  String _fileNameFor(String url) {
+  String _fileNameFor(String url, {bool fullQuality = false}) {
     var hash = 0;
     for (final unit in url.codeUnits) {
       hash = 0x1fffffff & (hash + unit);
@@ -104,6 +139,11 @@ class ThumbnailCache {
     hash = 0x1fffffff & (hash + ((0x03ffffff & hash) << 3));
     hash ^= hash >> 11;
     hash = 0x1fffffff & (hash + ((0x00003fff & hash) << 15));
+    // USB thumbs/full copies are JPEG bytes from the platform side; content://
+    // paths have no useful image extension.
+    if (url.startsWith('usb:')) {
+      return fullQuality ? '$hash.full.jpg' : '$hash.jpg';
+    }
     final ext = p.extension(Uri.parse(url).path);
     return '$hash${ext.isEmpty ? '.jpg' : ext}';
   }

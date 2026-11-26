@@ -9,6 +9,7 @@ import 'package:path_provider/path_provider.dart';
 import '../models/camera_item.dart';
 import '../models/transferred_photo.dart';
 import 'destination_folder.dart';
+import 'usb_camera.dart';
 
 enum TransferOutcome { saved, skippedExisting, skippedRaw, failed }
 
@@ -281,6 +282,11 @@ class TransferService {
     File file,
     void Function(TransferProgress progress)? onProgress,
   ) async {
+    if (resource.url.startsWith('usb:')) {
+      await _downloadUsb(item, position, resource, file, onProgress);
+      return;
+    }
+
     final request = http.Request('GET', Uri.parse(resource.url));
     final response = await _client.send(request);
 
@@ -327,6 +333,60 @@ class TransferService {
     // download time, the closest thing available.
     final captured = item.captured;
     if (captured != null) await file.setLastModified(captured);
+  }
+
+  /// Cable transfer: the Kotlin side streams the FAT file into [file] via
+  /// libaums. Progress is coarse (0 → done) because the copy runs as one
+  /// platform call rather than a Dart-readable byte stream.
+  Future<void> _downloadUsb(
+    CameraItem item,
+    int position,
+    CameraResource resource,
+    File file,
+    void Function(TransferProgress progress)? onProgress,
+  ) async {
+    final parsed = UsbCamera.parseUrl(resource.url);
+    if (parsed == null) throw Exception('bad usb url');
+    final (cardId, usbPath) = parsed;
+    final total = resource.byteSize ?? 0;
+
+    _emitProgress(item, position, 0, total, onProgress, force: true);
+    if (_cancelled) throw Exception('cancelled');
+
+    await UsbCamera.copyJpeg(
+      cardId: cardId,
+      usbPath: usbPath,
+      destPath: file.path,
+    );
+
+    final written = await file.length();
+    _sessionBytes += written;
+    _emitProgress(
+      item,
+      position,
+      written,
+      total > 0 ? total : written,
+      onProgress,
+      force: true,
+    );
+
+    final captured = item.captured;
+    if (captured != null) await file.setLastModified(captured);
+  }
+
+  /// Publishes a JPEG that already lives in [destinationDirectory].
+  ///
+  /// The in-app album lists that folder. A Photos or chosen-folder failure
+  /// leaves the cache file in place so the shot is not thrown away.
+  Future<void> commitTransferredFile(File file, {DateTime? takenAt}) async {
+    if (takenAt != null) {
+      try {
+        await file.setLastModified(takenAt);
+      } on FileSystemException {
+        // The album then groups the shot by when it arrived.
+      }
+    }
+    await _addToGallery(file);
   }
 
   Future<void> _addToGallery(File file) async {

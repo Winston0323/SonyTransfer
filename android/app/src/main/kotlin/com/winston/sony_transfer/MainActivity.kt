@@ -8,6 +8,7 @@ import android.content.pm.PackageManager
 import android.location.LocationManager
 import android.net.ConnectivityManager
 import android.net.LinkProperties
+import android.net.MacAddress
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
@@ -19,23 +20,30 @@ import android.net.wifi.WifiNetworkSpecifier
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.PatternMatcher
 import android.os.PowerManager
 import android.provider.Settings
 import android.util.Log
+import android.view.WindowManager
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.documentfile.provider.DocumentFile
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
+import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodChannel
 import java.io.File
 import java.net.Inet4Address
 import java.net.InetAddress
 import java.nio.ByteBuffer
+import java.util.concurrent.Executors
 
 class MainActivity : FlutterActivity() {
     private val channelName = "sony_transfer/network"
+    private val usbEventsChannelName = "sony_transfer/usb_events"
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val usbExecutor = Executors.newSingleThreadExecutor()
+    private lateinit var usb: UsbMassStorage
 
     /** Holds the temporary camera Wi-Fi so releasing it actually leaves the AP. */
     private var cameraCallback: ConnectivityManager.NetworkCallback? = null
@@ -60,9 +68,13 @@ class MainActivity : FlutterActivity() {
      * going dark.
      */
     private var cpuLock: PowerManager.WakeLock? = null
+    private var multicastLock: WifiManager.MulticastLock? = null
 
     /** Pending result for a folder pick, resolved from [onActivityResult]. */
     private var folderPickResult: MethodChannel.Result? = null
+
+    /** Pending result for the Photos/media read permission used by USB MediaStore. */
+    private var pendingMediaPermissionResult: MethodChannel.Result? = null
 
     private val prefs by lazy {
         applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -72,12 +84,41 @@ class MainActivity : FlutterActivity() {
         private const val TAG = "SonyTransferWifi"
         private const val SCAN_PERMISSION_REQUEST = 1001
         private const val FOLDER_PICK_REQUEST = 1002
+        private const val MEDIA_PERMISSION_REQUEST = 1003
         private const val PREFS_NAME = "sony_transfer_prefs"
         private const val PREF_DESTINATION_URI = "destination_tree_uri"
     }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+
+        usb = UsbMassStorage(this)
+        usb.register()
+
+        EventChannel(flutterEngine.dartExecutor.binaryMessenger, usbEventsChannelName)
+            .setStreamHandler(
+                object : EventChannel.StreamHandler {
+                    override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
+                        usb.attachEventSink(events)
+                        // Tell Dart the current plug state as soon as it subscribes,
+                        // so a camera already connected before the app opened still
+                        // opens the cable-transfer screen.
+                        events?.success(
+                            mapOf(
+                                "event" to if (usb.status()["attached"] == true) {
+                                    "attached"
+                                } else {
+                                    "detached"
+                                },
+                            ),
+                        )
+                    }
+
+                    override fun onCancel(arguments: Any?) {
+                        usb.attachEventSink(null)
+                    }
+                },
+            )
 
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, channelName)
             .setMethodCallHandler { call, result ->
@@ -88,6 +129,7 @@ class MainActivity : FlutterActivity() {
                     "joinCameraWifi" -> {
                         val ssid = call.argument<String>("ssid")?.trim().orEmpty()
                         val password = call.argument<String>("password").orEmpty()
+                        val bssid = call.argument<String>("bssid")?.trim().orEmpty()
                         if (password.isEmpty()) {
                             result.success(
                                 joinOutcome(
@@ -97,7 +139,7 @@ class MainActivity : FlutterActivity() {
                                 ),
                             )
                         } else {
-                            joinCameraWifi(cm, ssid, password, result)
+                            joinCameraWifi(cm, ssid, password, bssid, result)
                         }
                     }
                     "openWifiSettings" -> {
@@ -125,6 +167,30 @@ class MainActivity : FlutterActivity() {
                         cm.bindProcessToNetwork(null)
                         result.success(true)
                     }
+                    "releaseBind" -> {
+                        cm.bindProcessToNetwork(null)
+                        releaseWifiLock()
+                        result.success(true)
+                    }
+                    "setKeepScreenOn" -> {
+                        setKeepScreenOn(call.argument<Boolean>("on") == true)
+                        result.success(true)
+                    }
+                    "setMulticastLock" -> {
+                        setMulticastLock(call.argument<Boolean>("on") == true)
+                        result.success(true)
+                    }
+                    "monitorSession" -> {
+                        val active = call.argument<Boolean>("active") == true
+                        val text = call.argument<String>("text")
+                        if (active) {
+                            requestMonitorNotificationPermission()
+                            MonitorService.start(this, text)
+                        } else {
+                            MonitorService.stop(this)
+                        }
+                        result.success(true)
+                    }
                     "disconnectWifi" -> result.success(disconnectWifi(cm))
                     "wifiGateway" -> result.success(wifiGateway(cm))
                     "pickDestinationFolder" -> pickDestinationFolder(result)
@@ -138,6 +204,87 @@ class MainActivity : FlutterActivity() {
                         val fileName = call.argument<String>("fileName")
                         result.success(saveFileToDestination(sourcePath, fileName))
                     }
+                    "usbStatus" -> result.success(usb.status())
+                    "usbRequestPermission" -> usb.requestPermission(result)
+                    "usbRequestMediaPermission" -> requestMediaPermission(result)
+                    "usbListCards" -> {
+                        usbExecutor.execute {
+                            try {
+                                val payload = usb.listCards()
+                                mainHandler.post { result.success(payload) }
+                            } catch (e: Exception) {
+                                Log.w(TAG, "usbListCards failed", e)
+                                mainHandler.post {
+                                    result.error("usb_list_cards", e.message, null)
+                                }
+                            }
+                        }
+                    }
+                    "usbListJpegs" -> {
+                        val cardId = call.argument<Int>("cardId") ?: 0
+                        usbExecutor.execute {
+                            try {
+                                val files = usb.listJpegs(cardId)
+                                mainHandler.post { result.success(files) }
+                            } catch (e: Exception) {
+                                Log.w(TAG, "usbListJpegs failed", e)
+                                mainHandler.post {
+                                    result.error("usb_list_jpegs", e.message, null)
+                                }
+                            }
+                        }
+                    }
+                    "usbCopyJpeg" -> {
+                        val cardId = call.argument<Int>("cardId") ?: 0
+                        val usbPath = call.argument<String>("usbPath").orEmpty()
+                        val destPath = call.argument<String>("destPath").orEmpty()
+                        if (usbPath.isEmpty() || destPath.isEmpty()) {
+                            result.success(mapOf("ok" to false, "reason" to "bad_args"))
+                        } else {
+                            usbExecutor.execute {
+                                try {
+                                    usb.copyJpeg(cardId, usbPath, destPath) { _, _ -> }
+                                    mainHandler.post {
+                                        result.success(mapOf("ok" to true, "reason" to null))
+                                    }
+                                } catch (e: Exception) {
+                                    Log.w(TAG, "usbCopyJpeg failed", e)
+                                    mainHandler.post {
+                                        result.success(
+                                            mapOf(
+                                                "ok" to false,
+                                                "reason" to (e.message ?: e.javaClass.simpleName),
+                                            ),
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    "usbLoadThumb" -> {
+                        val cardId = call.argument<Int>("cardId") ?: 0
+                        val usbPath = call.argument<String>("usbPath").orEmpty()
+                        val maxEdge = call.argument<Int>("maxEdge") ?: 256
+                        if (usbPath.isEmpty()) {
+                            result.success(null)
+                        } else {
+                            usbExecutor.execute {
+                                try {
+                                    val bytes = usb.loadThumb(cardId, usbPath, maxEdge)
+                                    mainHandler.post { result.success(bytes) }
+                                } catch (e: Exception) {
+                                    Log.w(TAG, "usbLoadThumb failed", e)
+                                    mainHandler.post { result.success(null) }
+                                }
+                            }
+                        }
+                    }
+                    "usbClose" -> {
+                        usbExecutor.execute {
+                            usb.close()
+                            mainHandler.post { result.success(true) }
+                        }
+                    }
                     else -> result.notImplemented()
                 }
             }
@@ -145,7 +292,12 @@ class MainActivity : FlutterActivity() {
 
     override fun onDestroy() {
         clearScanListeners()
+        MonitorService.stop(this)
+        setKeepScreenOn(false)
+        setMulticastLock(false)
         releaseWifiLock()
+        if (::usb.isInitialized) usb.unregister()
+        usbExecutor.shutdownNow()
         super.onDestroy()
     }
 
@@ -210,6 +362,49 @@ class MainActivity : FlutterActivity() {
                 Log.w(TAG, "cpu wake lock acquire failed", e)
             }
         }
+    }
+
+    private fun setKeepScreenOn(on: Boolean) {
+        if (on) {
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } else {
+            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+    }
+
+    private fun setMulticastLock(on: Boolean) {
+        if (on) {
+            if (multicastLock?.isHeld == true) return
+            val wifiManager =
+                applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            multicastLock = wifiManager.createMulticastLock("$packageName:discover").apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+            return
+        }
+        try {
+            multicastLock?.let { if (it.isHeld) it.release() }
+        } catch (e: RuntimeException) {
+            Log.w(TAG, "multicast lock release failed", e)
+        }
+        multicastLock = null
+    }
+
+    private fun requestMonitorNotificationPermission() {
+        if (Build.VERSION.SDK_INT < 33) return
+        if (ContextCompat.checkSelfPermission(
+                this,
+                android.Manifest.permission.POST_NOTIFICATIONS,
+            ) == PackageManager.PERMISSION_GRANTED
+        ) {
+            return
+        }
+        ActivityCompat.requestPermissions(
+            this,
+            arrayOf(android.Manifest.permission.POST_NOTIFICATIONS),
+            1004,
+        )
     }
 
     private fun releaseWifiLock() {
@@ -430,15 +625,52 @@ class MainActivity : FlutterActivity() {
         grantResults: IntArray,
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode != SCAN_PERMISSION_REQUEST) return
-        val pending = pendingScanResult ?: return
-        pendingScanResult = null
-        Log.i(
-            TAG,
-            "scan permissions: ${permissions.toList()} -> ${grantResults.toList()}",
-        )
-        performScan(pending)
+        when (requestCode) {
+            SCAN_PERMISSION_REQUEST -> {
+                val pending = pendingScanResult ?: return
+                pendingScanResult = null
+                Log.i(
+                    TAG,
+                    "scan permissions: ${permissions.toList()} -> ${grantResults.toList()}",
+                )
+                performScan(pending)
+            }
+            MEDIA_PERMISSION_REQUEST -> {
+                val pending = pendingMediaPermissionResult ?: return
+                pendingMediaPermissionResult = null
+                val granted = grantResults.isNotEmpty() &&
+                    grantResults.all { it == PackageManager.PERMISSION_GRANTED }
+                pending.success(mapOf("ok" to granted))
+            }
+        }
     }
+
+    private fun requestMediaPermission(result: MethodChannel.Result) {
+        val missing = mediaPermissions().filter {
+            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+        }
+        if (missing.isEmpty()) {
+            result.success(mapOf("ok" to true))
+            return
+        }
+        if (pendingMediaPermissionResult != null) {
+            result.error("busy", "A permission prompt is already open.", null)
+            return
+        }
+        pendingMediaPermissionResult = result
+        ActivityCompat.requestPermissions(
+            this,
+            missing.toTypedArray(),
+            MEDIA_PERMISSION_REQUEST,
+        )
+    }
+
+    private fun mediaPermissions(): Array<String> =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            arrayOf(android.Manifest.permission.READ_MEDIA_IMAGES)
+        } else {
+            arrayOf(android.Manifest.permission.READ_EXTERNAL_STORAGE)
+        }
 
     private fun scanCameraWifi(result: MethodChannel.Result) {
         if (pendingScanResult != null) {
@@ -486,8 +718,15 @@ class MainActivity : FlutterActivity() {
             completed = true
             clearScanListeners()
 
-            val all = readScanSsids(wifiManager)
+            val hits = readScanHits(wifiManager)
+            val all = hits.map { it.first }.sorted()
             val cameras = all.filter(::looksLikeCameraSsid)
+            val cameraBssids = HashMap<String, String>()
+            for ((name, mac) in hits) {
+                if (looksLikeCameraSsid(name) && !mac.isNullOrBlank()) {
+                    cameraBssids[name] = mac
+                }
+            }
 
             val problem = when {
                 cameras.isNotEmpty() -> null
@@ -508,6 +747,7 @@ class MainActivity : FlutterActivity() {
                 mapOf(
                     "cameras" to cameras,
                     "all" to all,
+                    "cameraBssids" to cameraBssids,
                     "problem" to problem,
                 ),
             )
@@ -584,18 +824,22 @@ class MainActivity : FlutterActivity() {
     }
 
     @Suppress("DEPRECATION")
-    private fun readScanSsids(wifiManager: WifiManager): List<String> {
+    private fun readScanHits(wifiManager: WifiManager): List<Pair<String, String?>> {
         val results: List<ScanResult> = try {
             wifiManager.scanResults ?: emptyList()
         } catch (e: SecurityException) {
             Log.w(TAG, "getScanResults denied", e)
             emptyList()
         }
-        return results
-            .mapNotNull { it.SSID?.trim()?.removeSurrounding("\"") }
-            .filter { it.isNotEmpty() && it != "<unknown ssid>" }
-            .distinct()
-            .sorted()
+        val byName = linkedMapOf<String, String?>()
+        for (result in results) {
+            val name = result.SSID?.trim()?.removeSurrounding("\"") ?: continue
+            if (name.isEmpty() || name == "<unknown ssid>") continue
+            // The first sighting is enough. A later BSSID for the same name is
+            // the same camera AP seen again.
+            if (!byName.containsKey(name)) byName[name] = result.BSSID
+        }
+        return byName.map { it.key to it.value }
     }
 
     /** Sony Send-to-Smartphone APs, plus a few other names cameras use. */
@@ -633,6 +877,7 @@ class MainActivity : FlutterActivity() {
         cm: ConnectivityManager,
         ssid: String,
         password: String,
+        bssid: String,
         result: MethodChannel.Result,
     ) {
         if (joinResult != null) {
@@ -684,7 +929,7 @@ class MainActivity : FlutterActivity() {
             when {
                 Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q -> {
                     Log.i(TAG, "temporary join via WifiNetworkSpecifier ssid=$ssid")
-                    joinWithSpecifier(cm, ssid, password)
+                    joinWithSpecifier(cm, ssid, password, bssid)
                 }
                 ssid.isEmpty() -> {
                     completeJoin(
@@ -712,10 +957,28 @@ class MainActivity : FlutterActivity() {
         cm: ConnectivityManager,
         ssid: String,
         password: String,
+        bssid: String,
     ) {
-        val builder = WifiNetworkSpecifier.Builder()
-            .setWpa2Passphrase(password)
-            .setSsid(ssid.removeSurrounding("\""))
+        val clean = ssid.removeSurrounding("\"").trim()
+        // Sony SSIDs look like DIRECT-ab12:ILCE-7RM3. setSsid() treats the colon
+        // specially on a lot of phones, so the join dies in about a second and
+        // the camera drops back to the shooting screen.
+        val builder = WifiNetworkSpecifier.Builder().setWpa2Passphrase(password)
+        try {
+            builder.setSsidPattern(
+                PatternMatcher(clean, PatternMatcher.PATTERN_LITERAL),
+            )
+        } catch (e: IllegalArgumentException) {
+            Log.w(TAG, "ssid pattern rejected for $clean", e)
+            builder.setSsid(clean)
+        }
+        parseMac(bssid)?.let { mac ->
+            try {
+                builder.setBssid(mac)
+            } catch (e: IllegalArgumentException) {
+                Log.w(TAG, "bssid rejected: $bssid", e)
+            }
+        }
 
         val request = NetworkRequest.Builder()
             .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
@@ -737,14 +1000,23 @@ class MainActivity : FlutterActivity() {
                 completeJoin(
                     false,
                     "unavailable",
-                    "Android did not create the temporary connection to $ssid. " +
-                        "Keep Send to Smartphone open on the camera and try again.",
+                    "Could not establish a connection to $clean.",
                 )
             }
 
             override fun onLost(network: Network) {
+                // Only a join that has not succeeded yet should release the
+                // bind. After onAvailable, Dart is already talking to the
+                // camera; unbinding here aborts that first request.
+                if (joinResult == null) return
+                Log.i(TAG, "specifier onLost before join completed")
                 cm.bindProcessToNetwork(null)
                 releaseWifiLock()
+                completeJoin(
+                    false,
+                    "unavailable",
+                    "Could not establish a connection to $clean.",
+                )
             }
         }
 
@@ -799,6 +1071,15 @@ class MainActivity : FlutterActivity() {
                 },
             )
         }, 2_500)
+    }
+
+    private fun parseMac(bssid: String): MacAddress? {
+        if (bssid.isBlank() || Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return null
+        return try {
+            MacAddress.fromString(bssid)
+        } catch (e: IllegalArgumentException) {
+            null
+        }
     }
 
     private fun joinOutcome(ok: Boolean, code: String?, message: String?) =
